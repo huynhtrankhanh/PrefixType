@@ -11,3 +11,5 @@ The area to paste the practice text should still remain a normal textarea.
 There are several trace files you can use to test your code to ensure robustness. You are also to fuzz the code for robustness too. You are to test the code in real chromium and compare with original PrefixType code.
 
 Touch selection: make sure to match Chrome on Android behavior as much as possible including showing handles.
+
+Test also the correctness and integrity of the database records and trace files.
