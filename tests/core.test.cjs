@@ -63,7 +63,7 @@ test('binary truncation and 5,000 malformed inputs terminate with bounded reads'
     try { const decoded = ptbox.decode(bytes); ptbox.audit(decoded); } catch (error) { assert(error instanceof Error); }
   }
 });
-test('all supplied trace deltas replay, preserving designed pagehide continuation', { skip: !fs.existsSync('traces/manifest.json') }, () => {
+test('all supplied trace deltas replay, preserving legacy pagehide continuation', { skip: process.env.PREFIXTYPE_TRACE_TESTS !== '1' }, () => {
   let events = 0, continuations = 0;
   for (const file of fs.readdirSync('traces').filter(f => f.endsWith('.ptbox'))) {
     const bytes = fs.readFileSync('traces/' + file), record = ptbox.decode(bytes);

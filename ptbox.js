@@ -1,6 +1,8 @@
 /* PTBOX v1: UTF-8 strings. v2: UTF-16LE strings (byte lengths), lossless even
- * for transient IME lone surrogates. All other fields are unchanged.
- * Offsets/deletion counts are UTF-16 code units in both versions. */
+ * for transient IME lone surrogates. v3 uses UTF-16LE and adds explicit
+ * session linkage immediately after each session ID: u8 0=legacy unknown,
+ * 1=independent session, 2=continued session followed by predecessor ID string.
+ * Offsets/deletion counts are UTF-16 code units in all versions. */
 (function (root) {
   'use strict';
   function wellFormed(text) {
@@ -85,15 +87,27 @@
     }
     return all;
   }
-  function encode(record, version = strings(record).every(wellFormed) ? 1 : 2) {
-    if (version !== 1 && version !== 2) throw new Error('Unsupported PTBOX version');
+  const hasLinkage = session => Object.hasOwn(session, 'previousSessionId');
+  function encode(record, version = record.fragments.some(f => hasLinkage(f.session)) ? 3 :
+    record.version ?? (strings(record).every(wellFormed) ? 1 : 2)) {
+    if (![1, 2, 3].includes(version)) throw new Error('Unsupported PTBOX version');
+    if (version < 3 && record.fragments.some(f => hasLinkage(f.session))) throw new Error('PTBOX v1/v2 cannot preserve session linkage');
     if (version === 1 && !strings(record).every(wellFormed)) throw new Error('PTBOX v1 cannot preserve lone surrogates');
     const w = new Writer(version); w.bytes([80, 84, 66, 79, 88]); w.u8(version);
     w.f64(record.exportedAt); w.string(record.dayKey); w.string(record.timeZone);
     w.f64(record.dayStart); w.f64(record.dayEnd); w.f64(record.accumulatedMs); w.uint(record.fragments.length);
     for (const f of record.fragments) {
       const s = f.session;
-      w.string(s.id); w.f64(s.a); w.f64(s.z == null ? NaN : s.z); w.f64(f.fragmentStart); w.f64(f.fragmentEnd);
+      w.string(s.id);
+      if (version === 3) {
+        if (!hasLinkage(s)) w.u8(0);
+        else if (s.previousSessionId === null) w.u8(1);
+        else {
+          if (typeof s.previousSessionId !== 'string' || !s.previousSessionId) throw new Error('Invalid predecessor ID');
+          w.u8(2); w.string(s.previousSessionId);
+        }
+      }
+      w.f64(s.a); w.f64(s.z == null ? NaN : s.z); w.f64(f.fragmentStart); w.f64(f.fragmentEnd);
       w.string(s.r || ''); w.string(s.q || ''); w.f64(Number.isFinite(s.o) ? s.o : NaN);
       w.string(s.x || ''); w.string(f.initialValue); w.uint(f.events.length);
       for (const e of f.events) { w.f64(e.t); w.uint(e.p); w.uint(e.d); w.string(e.i); w.uint(e.s); w.uint(e.e); }
@@ -103,12 +117,21 @@
   function decode(bytes) {
     const r = new Reader(bytes);
     if (String.fromCharCode(...r.take(5)) !== 'PTBOX') throw new Error('Invalid PTBOX signature');
-    r.version = r.u8(); if (r.version !== 1 && r.version !== 2) throw new Error('Unsupported PTBOX version');
+    r.version = r.u8(); if (![1, 2, 3].includes(r.version)) throw new Error('Unsupported PTBOX version');
     const record = { version: r.version, exportedAt: r.f64(), dayKey: r.string(), timeZone: r.string(),
       dayStart: r.f64(), dayEnd: r.f64(), accumulatedMs: r.f64(), fragments: [] };
     const count = r.count();
     for (let i = 0; i < count; i++) {
-      const session = { id: r.string(), a: r.f64(), z: r.f64() };
+      const session = { id: r.string() };
+      if (r.version === 3) {
+        const kind = r.u8();
+        if (kind === 1) session.previousSessionId = null;
+        else if (kind === 2) {
+          session.previousSessionId = r.string();
+          if (!session.previousSessionId) throw new Error('Empty predecessor ID');
+        } else if (kind !== 0) throw new Error('Invalid session linkage kind');
+      }
+      session.a = r.f64(); session.z = r.f64();
       if (Number.isNaN(session.z)) session.z = null;
       const f = { session, fragmentStart: r.f64(), fragmentEnd: r.f64() };
       session.r = r.string(); session.q = r.string(); session.o = r.f64(); session.x = r.string();
@@ -130,10 +153,12 @@
     }
     return next;
   }
-  // The original recorder intentionally continues the editor's text after
-  // pagehide in a new session. Such a session's first delta may refer to the
-  // preceding session; session boundaries are not necessarily text resets.
+  // New sessions carry a self-contained initial state and explicit linkage.
+  // Retain inference only for legacy records without linkage metadata.
   function initialState(fragment, previous) {
+    if (hasLinkage(fragment.session)) {
+      return { text: fragment.initialValue, continued: fragment.session.previousSessionId !== null };
+    }
     const first = fragment.events[0];
     if (!fragment.initialValue && first && first.p + first.d > 0 &&
         previous?.session.r === 'pagehide' && previous.session.x === fragment.session.x) {
@@ -148,9 +173,20 @@
     if (record.dayEnd < record.dayStart || record.exportedAt < record.dayEnd || record.accumulatedMs < 0) errors.push('Invalid day interval');
     let accumulated = 0, eventCount = 0, continuations = 0, previous;
     const ids = new Set();
+    const fragments = new Map(record.fragments.map(f => [f.session.id, f]));
+    const finalStates = new Map();
     for (const f of record.fragments) {
       const s = f.session;
       if (ids.has(s.id)) errors.push('Duplicate session ' + s.id); ids.add(s.id);
+      if (hasLinkage(s) && s.previousSessionId !== null) {
+        if (typeof s.previousSessionId !== 'string' || !s.previousSessionId || s.previousSessionId === s.id) {
+          errors.push('Invalid predecessor ID ' + s.id);
+        }
+        const parent = fragments.get(s.previousSessionId)?.session;
+        if (parent && (parent.r !== 'pagehide' || parent.z === null || parent.z > s.a || parent.x !== s.x)) {
+          errors.push('Invalid pagehide predecessor ' + s.id);
+        }
+      }
       for (const key of ['a']) finite(s[key], key);
       if (s.z !== null) finite(s.z, 'session end');
       finite(f.fragmentStart, 'fragment start'); finite(f.fragmentEnd, 'fragment end');
@@ -167,8 +203,24 @@
         try { text = apply(text, e); } catch (error) { errors.push(s.id + ':' + index + ': ' + error.message); replayValid = false; break; }
         if (!wellFormed(text)) warnings.push('Lone surrogate in state ' + s.id + ':' + index);
       }
-      if (replayValid) previous = { session: s, text };
-      if (replayValid && s.r === 'completed' && s.z <= record.dayEnd && text !== s.x) errors.push('Completed text differs from target ' + s.id);
+      if (replayValid) { previous = { session: s, text }; finalStates.set(s.id, text); }
+      // A commit at the exclusive midnight boundary belongs to the next file.
+      if (replayValid && s.r === 'completed' && s.z < record.dayEnd && text !== s.x) errors.push('Completed text differs from target ' + s.id);
+    }
+    const checked = new Set();
+    for (const f of record.fragments) {
+      const parent = fragments.get(f.session.previousSessionId);
+      if (parent && f.fragmentStart === f.session.a && parent.fragmentEnd === parent.session.z &&
+          finalStates.has(parent.session.id) && f.initialValue !== finalStates.get(parent.session.id)) {
+        errors.push('Continuation initial text differs from predecessor ' + f.session.id);
+      }
+      const path = new Set();
+      let cursor = f.session.id;
+      while (fragments.has(cursor) && !checked.has(cursor)) {
+        if (path.has(cursor)) { errors.push('Cyclic session linkage ' + cursor); break; }
+        path.add(cursor); cursor = fragments.get(cursor).session.previousSessionId;
+      }
+      for (const id of path) checked.add(id);
     }
     if (Math.abs(accumulated - record.accumulatedMs) > .01) errors.push('Accumulated duration mismatch');
     return { errors, warnings, fragments: record.fragments.length, events: eventCount, continuations };

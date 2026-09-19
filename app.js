@@ -31,6 +31,7 @@
       let recordsRefreshId = null;
       let recorderCheckpointId = null;
       let activeSession = null;
+      let pagehideContinuation = null;
       let writeChain = Promise.resolve();
       let pendingWrites = [];
       let writeScheduled = false;
@@ -194,6 +195,8 @@
         if (!releaseOwner) ownerReady = holdOwnerLock();
         activeSession = {
           id: makeSessionId(at),
+          previousSessionId: pagehideContinuation?.id ?? null,
+          initialText: pagehideContinuation?.text ?? "",
           owner,
           a: at,
           z: null,
@@ -203,6 +206,7 @@
           q: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
           o: new Date(at).getTimezoneOffset()
         };
+        pagehideContinuation = null;
         putSession(activeSession);
         recorderCheckpointId = window.setInterval(() => {
           if (!activeSession) return;
@@ -212,10 +216,14 @@
       }
 
       function finalizeRecording(reason, at = Date.now()) {
+        if (reason !== "pagehide") pagehideContinuation = null;
         if (!activeSession) return;
         activeSession.z = Math.max(activeSession.a, activeSession.c, at);
         activeSession.c = activeSession.z;
         activeSession.r = reason;
+        if (reason === "pagehide") {
+          pagehideContinuation = { id: activeSession.id, text: typingInput.value };
+        }
         putSession(activeSession);
         activeSession = null;
         if (recorderCheckpointId !== null) {
@@ -237,7 +245,7 @@
       function applyDelta(value, event) {
         return value.slice(0, event.p) + event.i + value.slice(event.p + event.d);
       }
-      function syncGeometry() { typingInput.resize(); if (typingInput.hasFocus) typingInput.reveal(); }
+      function syncGeometry() { typingInput.resize(); }
       function ensureCaretVisible() { typingInput.reveal(); typingInput.invalidate(); }
 
       function elapsedSeconds() {
@@ -470,7 +478,7 @@
           );
           const events = eventsBySession.get(session.id) || [];
           events.sort((a, b) => a.k - b.k);
-          let initialValue = "";
+          let initialValue = session.initialText ?? "";
           const fragmentEvents = [];
           for (const event of events) {
             if (event.t < fragmentStart) {
@@ -494,6 +502,7 @@
         }
 
         return {
+          version: 3,
           dayKey,
           timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
           dayStart: bounds.start,
@@ -689,10 +698,6 @@
       if (window.visualViewport) {
         window.visualViewport.addEventListener("resize", updateVisualViewport);
         window.visualViewport.addEventListener("scroll", updateVisualViewport);
-      }
-
-      if ("ResizeObserver" in window) {
-        new ResizeObserver(syncGeometry).observe(typingInput.element);
       }
 
       window.PrefixType = {

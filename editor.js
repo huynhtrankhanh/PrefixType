@@ -128,6 +128,13 @@
         el.addEventListener('blur', () => this.invalidate());
       }
       canvas.addEventListener('keydown', event => this.keydown(event));
+      canvas.addEventListener('beforeinput', event => {
+        if (event.inputType !== 'insertParagraph' && event.inputType !== 'insertLineBreak') return;
+        // Let the browser distinguish a newline from an IME confirmation.
+        // Software keyboards can send this intent without an Enter keydown.
+        event.preventDefault();
+        if (!this.composing && !event.isComposing) this.insert('\n');
+      });
       canvas.addEventListener('copy', event => this.clipboard(event, false));
       canvas.addEventListener('cut', event => this.clipboard(event, true));
       canvas.addEventListener('paste', event => {
@@ -317,22 +324,28 @@
           start = Math.min(start, dest); end = Math.max(end, dest);
         }
         if (start !== end) this.replace(start, end - start, '');
-      } else if (key === 'Enter') { event.preventDefault(); this.insert('\n'); }
+      }
     }
     resize() {
       const rect = this.element.parentElement.getBoundingClientRect();
       const style = getComputedStyle(this.element);
       const width = rect.width, height = rect.height, ratio = devicePixelRatio || 1;
       const font = `${style.fontSize} ${style.fontFamily}`;
-      if (width !== this.width || font !== this.font) {
-        this.lines = []; this.iterator = null; this.done = false; this.widths.clear();
+      const lineHeight = parseFloat(style.lineHeight);
+      const padding = innerWidth <= 620 ? 16 : Math.max(18, Math.min(34, innerWidth * .03));
+      const changed = width !== this.width || height !== this.height || font !== this.font ||
+        lineHeight !== this.lineHeight || padding !== this.padding || ratio !== this.ratio;
+      if (width !== this.width || font !== this.font || lineHeight !== this.lineHeight || padding !== this.padding) {
+        this.lines = []; this.iterator = null; this.done = false;
       }
+      if (font !== this.font) this.widths.clear();
       this.width = width; this.height = height; this.font = font;
-      this.fontSize = parseFloat(style.fontSize); this.lineHeight = parseFloat(style.lineHeight);
-      this.padding = innerWidth <= 620 ? 16 : Math.max(18, Math.min(34, innerWidth * .03));
-      this.element.width = Math.max(1, Math.round(width * ratio));
-      this.element.height = Math.max(1, Math.round(height * ratio));
-      this.ctx.setTransform(ratio, 0, 0, ratio, 0, 0); this.ctx.font = font; this.ctx.textBaseline = 'alphabetic';
+      this.fontSize = parseFloat(style.fontSize); this.lineHeight = lineHeight;
+      this.padding = padding; this.ratio = ratio;
+      // Measurements need the new font immediately, but changing canvas width
+      // or height clears its pixels. Defer those assignments to the paint frame.
+      this.ctx.font = font;
+      if (changed && this.hasFocus) this.reveal();
       this.invalidate();
     }
     displayText() { return this.value + this.model.target.slice(this.prefix); }
@@ -489,7 +502,14 @@
     paint() {
       if (this.nativeMode) { this.handles.forEach(handle => handle.hidden = true); this.toolbar.hidden = true; return; }
       this.ensureLayout();
-      const ctx = this.ctx; ctx.clearRect(0, 0, this.width, this.height);
+      const pixelWidth = Math.max(1, Math.round(this.width * this.ratio));
+      const pixelHeight = Math.max(1, Math.round(this.height * this.ratio));
+      if (this.element.width !== pixelWidth) this.element.width = pixelWidth;
+      if (this.element.height !== pixelHeight) this.element.height = pixelHeight;
+      const ctx = this.ctx;
+      ctx.setTransform(this.ratio, 0, 0, this.ratio, 0, 0);
+      ctx.font = this.font; ctx.textBaseline = 'alphabetic';
+      ctx.clearRect(0, 0, this.width, this.height);
       const first = Math.max(0, Math.floor((this.scroll - this.padding) / this.lineHeight));
       const last = Math.min(this.lines.length, Math.ceil((this.scroll + this.height - this.padding) / this.lineHeight));
       for (let row = first; row < last; row++) {

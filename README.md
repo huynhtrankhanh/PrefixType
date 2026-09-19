@@ -42,7 +42,9 @@ On touch screens, selection handles use 44-pixel touch targets. Long press opens
 
 Completion happens when the committed input exactly equals the practice text. It stops the timer and recorder and shows **Complete**. Further edits do **not** change that completed attempt's statistics or append events to its record. **Restart** or **Use text** begins another attempt. A provisional IME match is completed only after composition commits.
 
-The original pagehide continuation behavior is preserved. A `pagehide` ends the recording session, but a restored editor can retain its text. Its next edit starts another session whose delta refers to that retained text. A session boundary therefore does not always mean an empty editor. Trace replay carries the preceding pagehide session's state when the next session requires it. It does not invent a new initial-text field or rewrite the original traces.
+A `pagehide` ends the recording session, but a restored editor can retain its text. Its next edit starts a new session with an explicit `previousSessionId` pointing to the session closed by pagehide. The new session also stores `initialText`, so its deltas can replay independently. Repeated pagehide events without an intervening edit do not create empty sessions. Restarting or changing the practice text clears the pending link; independent attempts have `previousSessionId: null`.
+
+Crossing midnight does **not** start a new session. Daily exports clip that session into fragments with the **same session ID**, which is sufficient to correlate them. No predecessor link is added for a day boundary. A continued session's existing predecessor ID stays the same in each of its daily fragments. Legacy records lacking linkage metadata remain readable using the older inference rule.
 
 Accuracy counts inserted graphemes, including replacements of the same length. Deletions do not increase the insertion count. WPM and progress retain the original UTF-16 length convention: WPM uses five code units per word, and progress uses correct-prefix code units divided by target length. Elapsed practice time uses the monotonic performance clock; record timestamps use Unix milliseconds.
 
@@ -52,7 +54,7 @@ Accuracy counts inserted graphemes, including replacements of the same length. D
 
 EditContext replacement ranges and all stored offsets remain **UTF-16 code-unit offsets**. IME replacements may temporarily fall inside a grapheme or surrogate pair; those edits are preserved exactly. User navigation then uses grapheme boundaries. The renderer keeps the mistake/expected-text boundary separate so a trailing ZWJ in a mistake cannot absorb an expected glyph.
 
-The editor handles `textupdate`, composition start/end, IME formatting, control/selection bounds, and character-bound requests. Both halves of a surrogate pair receive the same character rectangle. Canvas draws complete directional runs to preserve shaping, with clipped colors and selection backgrounds. The included `bidi-js` library supplies embedding levels and run ordering.
+The editor handles `textupdate`, composition start/end, IME formatting, control/selection bounds, and character-bound requests. Newlines are inserted from `beforeinput`'s `insertLineBreak`/`insertParagraph` intents, rather than directly from Enter keydown. This supports software keyboards without Enter key events and leaves IME confirmation to the browser; an active composition does not acquire an unintended newline. Both halves of a surrogate pair receive the same character rectangle. Canvas draws complete directional runs to preserve shaping, with clipped colors and selection backgrounds. The included `bidi-js` library supplies embedding levels and run ordering.
 
 ## Implementation and performance
 
@@ -68,13 +70,13 @@ The editor handles `textupdate`, composition start/end, IME formatting, control/
 | `tests/fixtures/PrefixType-original.html` | Unmodified original app used as the benchmark/reference baseline |
 | `tests/fixtures/trace-manifest.json` | Download names, Drive IDs, sizes, and pinned SHA-256 hashes |
 
-The canvas path consumes exact EditContext deltas instead of comparing two whole textarea values. Prefix matching resumes at the earliest changed position. Correct appends and suffix deletions can reuse the displayed layout entirely. Other edits invalidate layout from one visual line before the change. Grapheme iteration and line layout proceed only as far as the viewport or requested caret position, and painting visits visible lines. Glyph-width caching is bounded, and paints are coalesced with `requestAnimationFrame`.
+The canvas path consumes exact EditContext deltas instead of comparing two whole textarea values. Prefix matching resumes at the earliest changed position. Correct appends and suffix deletions can reuse the displayed layout entirely. Other edits invalidate layout from one visual line before the change. Grapheme iteration and line layout proceed only as far as the viewport or requested caret position, and painting visits visible lines. Glyph-width caching is bounded, and paints are coalesced with `requestAnimationFrame`. Canvas bitmap dimensions change only inside the paint callback, immediately before redrawing, and only if their pixel dimensions changed. Repeated geometry notifications therefore preserve the existing picture instead of clearing it between frames. Width, font, line height, padding, and pixel-ratio changes are tracked; one observer watches the containing editor area.
 
 This removes the per-input mirror/probe DOM reconstruction. Text is still held in JavaScript strings: a large replacement, a distant caret jump, selecting a large document, or a resize can require substantial string/layout work. The native textarea mode uses a full-value diff because it does not receive EditContext deltas.
 
 ### Measurements
 
-Measured in real headless Chromium **145.0.7632.6**, Linux x64, with a 1100 × 760 viewport. The baseline fixture's SHA-256 is `2c686ea5161bcbe10dc72dea4870031786e35895740478eebe9e9f53c357fcd6`.
+The following historical measurements precede the IME and session-linkage fixes; the revoked trace corpus was not accessed or replayed for those fixes. Measured in real headless Chromium **145.0.7632.6**, Linux x64, with a 1100 × 760 viewport. The baseline fixture's SHA-256 is `2c686ea5161bcbe10dc72dea4870031786e35895740478eebe9e9f53c357fcd6`.
 
 The synthetic benchmark types near the end of each target, warms up for 20 edits, then measures 100 edits. Each sample includes the input handler, queued animation callbacks, and forced DOM layout. It measures synchronous CPU work, including canvas drawing commands; asynchronous IndexedDB commits, GPU presentation, and display latency are excluded.
 
@@ -101,12 +103,12 @@ The existing IndexedDB database remains `prefixtype-blackbox`, schema version **
 
 | Store | Fields |
 | --- | --- |
-| `sessions`, key `id` | `a`: start; `z`: end or null; `c`: checkpoint; `r`: end reason; `x`: practice text; `q`: time zone; `o`: UTC offset minutes; optional `owner`: live-tab identity |
+| `sessions`, key `id` | `a`: start; `z`: end or null; `c`: checkpoint; `r`: end reason; `x`: practice text; `q`: time zone; `o`: UTC offset minutes; optional `owner`: live-tab identity; `previousSessionId`: pagehide predecessor or null; `initialText`: session starting text |
 | `events`, auto-increment key `k` | `sid`: session ID; `t`: timestamp; `p`: replacement offset; `d`: deleted code units; `i`: inserted string; `s`, `e`: resulting selection start/end |
 
 Session metadata and its deltas are written in the same transaction. Writes queued together are batched, and daily exports read sessions and events in one consistent transaction. Checkpoints occur every five seconds. Interrupted sessions recover to their last checkpoint. Where Web Locks are available, recovery skips sessions owned by a live tab; the tab releases its lock on pagehide and reacquires it on restoration. Storage failures are reported and prevent a misleading successful export.
 
-Daily records use browser-local midnight boundaries, including 23- or 25-hour DST days. Today's export ends at its snapshot time. A fragment includes edits in that day window and the state reconstructed from earlier edits. Session reasons remain `completed`, `restarted`, `practice-text-changed`, `pagehide`, and `recovered`.
+Daily records use browser-local midnight boundaries, including 23- or 25-hour DST days. Today's export ends at its snapshot time. A fragment includes edits in that day window and its state reconstructed from `initialText` plus earlier edits. Day windows are half-open: an edit exactly at midnight belongs only to the next day's file, retaining the same session ID. Session reasons remain `completed`, `restarted`, `practice-text-changed`, `pagehide`, and `recovered`.
 
 ### PTBOX encoding
 
@@ -115,7 +117,10 @@ The binary codec is available as `window.Ptbox` in the browser and `require('./p
 All timestamps are little-endian Float64 Unix epoch milliseconds. Integers are unsigned LEB128-style varints, bounded to JavaScript safe integers. Each string starts with its **byte** length.
 
 - **Version 1:** strings use UTF-8, preserving compatibility with the supplied files and existing readers.
-- **Version 2:** strings use UTF-16LE. The encoder selects this version only when a string contains an unpaired surrogate, which UTF-8/TextEncoder would otherwise replace with U+FFFD. All other field ordering and offset semantics remain unchanged. Old v1-only readers need v2 support for these files.
+- **Version 2:** strings use UTF-16LE, preserving unpaired surrogates that UTF-8/TextEncoder would replace with U+FFFD. Other fields match v1.
+- **Version 3:** current app exports use UTF-16LE and add explicit session linkage after each session ID. Fragment initial text makes new continuation sessions independently replayable. Readers limited to v1/v2 must add v3 support.
+
+The decoder accepts all three versions. The codec preserves the version of decoded legacy records unless linkage is added; it refuses to export explicit linkage as v1/v2 rather than silently discarding it. Old sessions mixed into a v3 export retain an explicit "linkage unknown" tag, so no predecessor is fabricated.
 
 Header field order:
 
@@ -125,7 +130,7 @@ Header field order:
 
 For each fragment:
 
-1. Session ID; original start; original end (`NaN` while open).
+1. Session ID; **v3 only:** one linkage byte (`0`: legacy/unknown, `1`: independent session, `2`: continuation). For tag `2`, a nonempty predecessor-ID string follows. Then original start and original end (`NaN` while open).
 2. Clipped fragment start/end; end reason; session time zone; offset minutes.
 3. Practice text; initial fragment text; delta count.
 4. For each delta: timestamp, replacement offset, deletion count, inserted string, selection start, selection end.
@@ -136,7 +141,7 @@ Apply a delta to a JavaScript string as:
 value = value.slice(0, event.p) + event.i + value.slice(event.p + event.d);
 ```
 
-For a continuation session, initialize replay with `Ptbox.initialState(fragment, previous)`, where `previous` contains the preceding session metadata and reconstructed text. Independent session fragments use their recorded initial value. The validator checks signatures, versions, truncation, varint overflow, UTF encoding, trailing bytes, edit/selection ranges, event ordering, fragment intervals, accumulated durations, and completed text. A trace is a sequence of text changes; it does not contain raw key, pointer, or OS candidate-window events.
+New v3 session fragments replay directly from `fragment.initialValue`; use `session.previousSessionId` for linkage, even when the predecessor is in a different file. `Ptbox.initialState(fragment, previous)` retains inference for legacy records only; explicit linkage never depends on file ordering. The validator checks signatures, versions, truncation, varint overflow, UTF encoding, trailing bytes, edit/selection ranges, event ordering, fragment intervals, accumulated durations, completed text, invalid/cyclic predecessor links, and predecessor/initial-text agreement when both complete fragments are available. A trace is a sequence of text changes; it does not contain raw key, pointer, or OS candidate-window events.
 
 ## Tests and reproduction
 
@@ -145,11 +150,9 @@ Node.js 22 and Python 3 were used for development. Install the pinned test depen
 ```sh
 npm ci
 npx playwright install --with-deps chromium
-npm run download:traces
 npm test
-npm run test:traces
+npm run test:ime
 npm run test:browser
-npm run benchmark
 ```
 
 On the Ubuntu 26.04 sandbox used for these measurements, Playwright 1.58.2 did not recognize the OS. Its Ubuntu 24.04 browser/dependency package was installed using:
@@ -158,20 +161,22 @@ On the Ubuntu 26.04 sandbox used for these measurements, Playwright 1.58.2 did n
 PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 npx playwright install --with-deps chromium
 ```
 
-Traces come from the [provided Google Drive folder](https://drive.google.com/drive/folders/1Jw9isYHy7z-PFH5ucsfXvABQJV1QyPar). The downloader uses Python's standard library. Downloaded binaries stay in ignored `traces/`; their total size is **7,467,919 bytes**. Validation compares them with the pinned hashes. All 28 files decode and encode **byte for byte**, and all events validate with the designed pagehide continuation. The original files are not modified.
+Normal tests use synthetic text and records and do not access trace files or the network. The historical corpus replay in the unit suite is now opt-in (`PREFIXTYPE_TRACE_TESTS=1 npm test`). `npm run test:traces` and `npm run benchmark` also require a separately authorized corpus; they are not part of the regression verification.
+
+Earlier validation used 28 supplied files totaling **7,467,919 bytes**, compared with pinned hashes. Those files round-tripped byte for byte, with legacy continuation inferred from prior session state. These are historical results; the revoked corpus was not reopened for the current changes.
 
 The checked suite covers:
 
 - 20,000 deterministic Unicode mutations against an independent whole-string reference.
 - Grapheme movement/deletion; UTF-8 and lossless UTF-16 round trips; every truncated prefix of a fixture; 5,000 malformed binary cases.
-- Every supplied trace delta through the text model and the real Chromium canvas editor.
+- Historical validation of every supplied trace delta through the text model and real Chromium canvas editor; this check is skipped unless explicitly enabled.
 - 1,200 browser mutations comparing incremental canvas layout with a fresh layout, plus long lines, resize, and Unicode rendering seams.
 - Native Chromium textarea comparisons for keyboard movement and Shift/Ctrl selection.
 - Real clipboard commands, mouse selection, undo/redo, and CDP-driven IME composition, commit, cancellation, and character bounds.
 - Mobile-emulated long press, selection handles, dragging, scrolling, menu visibility, and paste into an empty editor.
 - IndexedDB replay/export, replacement statistics, terminal completion, pagehide continuation, concurrent tabs, interrupted-session recovery, midnight/DST clipping, and native fallback.
 
-The browser suite contains **14 test groups**. Generated reports and screenshots go to ignored `test-results/`: `trace-audit.json`, `browser.json`, `benchmark.json`, `trace-benchmark.json`, `desktop-editor.png`, and `mobile-selection.png`. The test server uses a random local port and the preserved original fixture, so future commits do not change the benchmark baseline.
+The main browser suite contains **14 test groups**, including explicit pagehide linkage and shared IDs across daily exports. A separate IME regression suite contains **4 checks** for keyboard-free newline intents, composition confirmation followed by Enter, repeated geometry notifications, and atomic resize/line-height changes. Seven synthetic codec tests cover v3 linkage, legacy compatibility, lone surrogates, standalone continuation replay, midnight fragments, cycles, malformed linkage tags, and truncation. These checks pass in Chromium 145.0.7632.6 without the trace corpus. Generated reports and screenshots go to ignored `test-results/`: `trace-audit.json`, `browser.json`, `benchmark.json`, `trace-benchmark.json`, `desktop-editor.png`, and `mobile-selection.png`. The test server uses a random local port and the preserved original fixture, so future commits do not change the benchmark baseline.
 
 ### Practical limits
 
