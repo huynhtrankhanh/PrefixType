@@ -85,6 +85,7 @@
       this.model = new TextModel(); this.ctx = canvas.getContext('2d');
       this.lines = []; this.widths = new Map(); this.scroll = 0; this.frame = 0;
       this.undoStack = []; this.redoStack = []; this.formats = []; this.composing = false; this.revision = 0;
+      this.commandDepth = 0; this.pendingCompositionCommit = false;
       this.nativeMode = !('EditContext' in root); this.touchMode = false; this.touchMenu = false;
       this.bidi = root.bidi_js();
       if (!this.nativeMode) {
@@ -98,8 +99,7 @@
           this.composing = true; this.compositionGroup = Symbol('composition');
         });
         this.editContext.addEventListener('compositionend', () => {
-          this.composing = false; this.compositionGroup = null; this.formats = []; this.invalidate();
-          this.dispatchEvent(new Event('compositioncommit'));
+          this.compositionEnded();
         });
         this.editContext.addEventListener('textformatupdate', event => {
           this.formats = event.getTextFormats(); this.invalidate();
@@ -130,10 +130,10 @@
       canvas.addEventListener('keydown', event => this.keydown(event));
       canvas.addEventListener('beforeinput', event => {
         if (event.inputType !== 'insertParagraph' && event.inputType !== 'insertLineBreak') return;
-        // Let the browser distinguish a newline from an IME confirmation.
-        // Software keyboards can send this intent without an Enter keydown.
+        // Software keyboards can send a newline intent without a named key.
+        // An active composition must not swallow an explicit editing command.
         event.preventDefault();
-        if (!this.composing && !event.isComposing) this.insert('\n');
+        this.runCommand(() => this.insert('\n'));
       });
       canvas.addEventListener('copy', event => this.clipboard(event, false));
       canvas.addEventListener('cut', event => this.clipboard(event, true));
@@ -195,6 +195,35 @@
     get prefix() { return this.model.prefix; }
     get hasFocus() { return document.activeElement === (this.nativeMode ? this.nativeInput : this.element); }
     focus(options = { preventScroll: true }) { (this.nativeMode ? this.nativeInput : this.element).focus(options); }
+    compositionEnded() {
+      if (!this.composing) return;
+      this.composing = false; this.compositionGroup = null; this.formats = []; this.invalidate();
+      if (this.commandDepth) this.pendingCompositionCommit = true;
+      else this.dispatchEvent(new Event('compositioncommit'));
+    }
+    runCommand(action) {
+      this.commandDepth++;
+      try {
+        if (this.composing) {
+          // Changing only updateSelection does not end Chromium's composition:
+          // subsequent IME text can still replace the old range. Deactivate the
+          // context to commit its displayed text, then reattach without moving
+          // DOM focus.
+          try { this.element.editContext = null; }
+          finally { this.element.editContext = this.editContext; }
+          this.compositionEnded();
+        }
+        return action();
+      } finally {
+        this.commandDepth--;
+        if (!this.commandDepth && this.pendingCompositionCommit) {
+          this.pendingCompositionCommit = false;
+          // Completion observes the result of the command, not a transient
+          // matching composition just before Enter/Delete/Undo changes it.
+          this.dispatchEvent(new Event('compositioncommit'));
+        }
+      }
+    }
     setNativeMode(enabled, focus = true) {
       this.nativeMode = enabled || !this.editContext;
       this.nativeInput.hidden = !this.nativeMode; this.element.hidden = this.nativeMode;
@@ -204,6 +233,7 @@
       this.invalidate();
     }
     reset(target, value = '') {
+      if (this.composing) return this.runCommand(() => this.reset(target, value));
       this.revision++;
       this.model.reset(target, value); this.lines = []; this.scroll = 0;
       this.undoStack = []; this.redoStack = []; this.formats = [];
@@ -215,6 +245,7 @@
       this.invalidate();
     }
     replace(p, d, i, selection, options = {}) {
+      if (this.composing && !options.fromContext) return this.runCommand(() => this.replace(p, d, i, selection, options));
       const delta = this.model.replace(p, d, i, selection);
       this.revision++; this.touchMenu = false;
       if (!options.history && (d || i.length)) {
@@ -245,8 +276,12 @@
       this.reveal(); this.invalidate();
       return delta;
     }
-    insert(text) { this.replace(this.model.start, this.model.end - this.model.start, text); }
+    insert(text) {
+      if (this.composing) return this.runCommand(() => this.insert(text));
+      this.replace(this.model.start, this.model.end - this.model.start, text);
+    }
     history(redo) {
+      if (this.composing) return this.runCommand(() => this.history(redo));
       const from = redo ? this.redoStack : this.undoStack, to = redo ? this.undoStack : this.redoStack;
       const entry = from.pop(); if (!entry) return;
       const edits = redo ? entry.edits : [...entry.edits].reverse();
@@ -255,6 +290,7 @@
       to.push(entry);
     }
     select(anchor, focus = anchor, reveal = true) {
+      if (this.composing) return this.runCommand(() => this.select(anchor, focus, reveal));
       this.model.select(anchor, focus);
       this.editContext?.updateSelection(this.model.start, this.model.end);
       if (reveal) this.reveal();
@@ -266,6 +302,7 @@
       if (cut) this.insert('');
     }
     async clipboardCommand(command) {
+      if (this.composing) return this.runCommand(() => this.clipboardCommand(command));
       const revision = this.revision, start = this.model.start, end = this.model.end;
       try {
         if (command === 'v') {
@@ -280,7 +317,20 @@
       }
     }
     keydown(event) {
-      if (event.isComposing || this.composing || event.keyCode === 229) return;
+      // IMEs often mark even named navigation keys as composing/keyCode 229.
+      // Dispatch commands by key; leave unrecognized Process/typing events to
+      // the IME instead of disabling every command while a draft is active.
+      const key = event.key;
+      const command = event.ctrlKey || event.metaKey;
+      const navigation = ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'];
+      const shortcut = command && ['a', 'z', 'y', 'c', 'x', 'v'].includes(key.toLowerCase());
+      const newline = key === 'Enter' && !command && !event.altKey;
+      if (!shortcut && !navigation.includes(key) && !['Backspace', 'Delete'].includes(key) && !newline) return;
+      event.preventDefault();
+      this.runCommand(() => this.editingKey(event, newline));
+    }
+    editingKey(event, newline) {
+      if (newline) { this.insert('\n'); return; }
       const command = event.ctrlKey || event.metaKey;
       const mac = /Mac|iPhone|iPad/.test(navigator.platform);
       const byWord = mac ? event.altKey : event.ctrlKey;

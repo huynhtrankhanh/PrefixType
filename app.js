@@ -297,7 +297,7 @@
       }
 
       function checkFinished() {
-        if (typingInput.composing) return;
+        if (typingInput.composing || typingInput.pendingCompositionCommit) return;
         const complete = practiceText.length > 0 && typingInput.value === practiceText;
 
         if (!complete) {

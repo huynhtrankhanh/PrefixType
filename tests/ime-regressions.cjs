@@ -24,7 +24,7 @@ const serve = require('./server.cjs');
     await check('Enter is a browser line-break intent, including keyboard-free IME input', async () => {
       await page.evaluate(() => {
         const editor = PrefixType.editor;
-        editor.element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 229, bubbles: true }));
+        editor.element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Process', keyCode: 229, bubbles: true }));
         editor.element.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertParagraph', bubbles: true, cancelable: true }));
       });
       assert.equal(await value(), '\n');
@@ -38,7 +38,6 @@ const serve = require('./server.cjs');
     await check('composition confirmation does not insert Enter; subsequent Enter inserts exactly once', async () => {
       await cdp.send('Input.imeSetComposition', { text: 'に', selectionStart: 1, selectionEnd: 1 });
       await cdp.send('Input.imeSetComposition', { text: '日本', selectionStart: 2, selectionEnd: 2 });
-      await page.keyboard.press('Enter');
       assert.equal(await value(), '日本');
       await cdp.send('Input.insertText', { text: '日本' });
       await page.keyboard.press('Enter'); assert.equal(await value(), '日本\n');
@@ -47,6 +46,88 @@ const serve = require('./server.cjs');
       await page.keyboard.press('Enter'); assert.equal(await value(), '日本\n');
       await page.keyboard.press('Control+z'); assert.equal(await value(), '日本\n\n');
       assert.equal(await page.evaluate(() => PrefixType.editor.editContext.text), await value());
+    });
+    const compose = (text, caret = text.length) => cdp.send('Input.imeSetComposition', {
+      text, selectionStart: caret, selectionEnd: caret
+    });
+    const state = () => page.evaluate(() => {
+      const e = PrefixType.editor;
+      return { text: e.value, anchor: e.model.anchor, focus: e.model.focus,
+        composing: e.composing, context: e.editContext.text, focused: e.hasFocus };
+    });
+    await check('Enter commits draft and inserts once without blur or clearing pixels', async () => {
+      await compose('日本');
+      await page.evaluate(() => {
+        const e = PrefixType.editor; e.paint(); window.editorBlurs = 0;
+        e.element.addEventListener('blur', () => window.editorBlurs++);
+      });
+      await page.keyboard.press('Enter');
+      assert.deepEqual(await state(), { text: '日本\n', anchor: 3, focus: 3,
+        composing: false, context: '日本\n', focused: true });
+      assert.deepEqual(await page.evaluate(() => {
+        const e = PrefixType.editor;
+        return [window.editorBlurs, e.ctx.getImageData(0, 0, e.element.width, e.element.height).data.some((v, i) => i % 4 === 3 && v)];
+      }), [0, true]);
+      await compose('語');
+      assert.equal(await value(), '日本\n語');
+    });
+    for (const key of ['ArrowLeft', 'ArrowRight', 'Control+Shift+ArrowLeft', 'Control+Shift+ArrowRight',
+      'Shift+ArrowLeft', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown', 'Backspace', 'Delete', 'Control+z']) {
+      await check(`active composition executes ${key} like committed text`, async () => {
+        const text = 'first line\n日本 words';
+        await compose(text, 14);
+        await cdp.send('Input.insertText', { text });
+        await page.evaluate(() => PrefixType.editor.select(14));
+        await page.keyboard.press(key);
+        const expected = await state();
+        await reset();
+        await compose(text, 14);
+        await page.keyboard.press(key);
+        assert.deepEqual(await state(), expected);
+        const start = Math.min(expected.anchor, expected.focus), end = Math.max(expected.anchor, expected.focus);
+        await compose('語');
+        assert.equal(await value(), expected.text.slice(0, start) + '語' + expected.text.slice(end));
+      });
+    }
+    await check('named composing keys act; unknown IME keys retain the draft', async () => {
+      await compose('日本');
+      for (const key of ['Process', 'Unidentified', 'a']) {
+        assert.equal(await page.evaluate(key => PrefixType.editor.element.dispatchEvent(new KeyboardEvent('keydown', {
+          key, keyCode: 229, isComposing: true, bubbles: true, cancelable: true
+        })), key), true);
+        assert.equal((await state()).composing, true);
+      }
+      assert.equal(await page.evaluate(() => PrefixType.editor.element.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'Enter', keyCode: 229, isComposing: true, bubbles: true, cancelable: true
+      }))), false);
+      assert.equal(await value(), '日本\n');
+      assert.equal((await state()).composing, false);
+    });
+    await check('software newline commits composition before insertion', async () => {
+      await compose('日本');
+      await page.evaluate(() => PrefixType.editor.element.dispatchEvent(new InputEvent('beforeinput', {
+        inputType: 'insertParagraph', isComposing: true, bubbles: true, cancelable: true
+      })));
+      assert.equal(await value(), '日本\n');
+      assert.equal((await state()).composing, false);
+    });
+    await check('selection and reset discard stale native composition ranges', async () => {
+      await compose('日本');
+      await page.evaluate(() => PrefixType.editor.select(1));
+      await compose('語');
+      assert.equal(await value(), '日語本');
+      await reset();
+      await compose('new');
+      assert.equal(await value(), 'new');
+    });
+    await check('completion observes the command result after committing a matching draft', async () => {
+      await page.evaluate(() => { PrefixType.reset('日本'); PrefixType.editor.focus(); });
+      await compose('日本');
+      assert.equal(await page.evaluate(() => PrefixType.stats.finished), false);
+      await page.keyboard.press('Enter');
+      assert.equal(await page.evaluate(() => PrefixType.stats.finished), false);
+      await page.keyboard.press('Backspace');
+      assert.equal(await page.evaluate(() => PrefixType.stats.finished), true);
     });
     await check('repeated geometry notifications never clear the painted composition', async () => {
       await cdp.send('Input.imeSetComposition', { text: 'にほん', selectionStart: 3, selectionEnd: 3 });
