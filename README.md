@@ -4,6 +4,8 @@ This PrefixType suffers from a lot of performance problems because of naive text
 
 Pay special attention to Unicode handling.
 
+Pay special attention to performance. Time, measure.
+
 The area to paste the practice text should still remain a normal textarea.
 
 There are several trace files you can use to test your code to ensure robustness. You are also to fuzz the code for robustness too. You are to test the code in real chromium and compare with original PrefixType code.
