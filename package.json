@@ -1,0 +1,15 @@
+{
+  "name": "prefixtype",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/*.test.cjs",
+    "test:browser": "node tests/browser.cjs",
+    "test:traces": "node scripts/validate-traces.cjs",
+    "benchmark": "node tests/benchmark.cjs && node tests/trace-benchmark.cjs",
+    "download:traces": "python3 scripts/download-traces.py"
+  },
+  "devDependencies": {
+    "playwright": "1.58.2",
+    "bidi-js": "1.0.3"
+  }
+}

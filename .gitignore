@@ -1,0 +1,6 @@
+node_modules/
+traces/*.ptbox
+traces/manifest.json
+test-results/
+
+__pycache__/
