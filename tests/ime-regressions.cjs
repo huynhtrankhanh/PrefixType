@@ -120,12 +120,12 @@ const serve = require('./server.cjs');
       await compose('new');
       assert.equal(await value(), 'new');
     });
-    await check('completion observes the command result after committing a matching draft', async () => {
+    await check('matching draft completes immediately and Enter preserves terminal completion', async () => {
       await page.evaluate(() => { PrefixType.reset('日本'); PrefixType.editor.focus(); });
       await compose('日本');
-      assert.equal(await page.evaluate(() => PrefixType.stats.finished), false);
+      assert.equal(await page.evaluate(() => PrefixType.stats.finished), true);
       await page.keyboard.press('Enter');
-      assert.equal(await page.evaluate(() => PrefixType.stats.finished), false);
+      assert.equal(await page.evaluate(() => PrefixType.stats.finished), true);
       await page.keyboard.press('Backspace');
       assert.equal(await page.evaluate(() => PrefixType.stats.finished), true);
     });

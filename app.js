@@ -297,7 +297,8 @@
       }
 
       function checkFinished() {
-        if (typingInput.composing || typingInput.pendingCompositionCommit) return;
+        // Completion is terminal, including a match in an active IME draft.
+        if (finishedAt) return;
         const complete = practiceText.length > 0 && typingInput.value === practiceText;
 
         if (!complete) {

@@ -213,12 +213,29 @@ const ptbox = require('../ptbox.js');
       });
       await page.setViewportSize({ width: 1100, height: 760 });
     });
-    await run('IME provisional match does not complete until commit', async () => {
+    await run('IME draft match immediately completes and later updates preserve the session', async () => {
       await reset('日本'); const cdp = await context.newCDPSession(page);
       await cdp.send('Input.imeSetComposition', { text: '日本', selectionStart: 2, selectionEnd: 2 });
-      assert.equal(await page.evaluate(() => PrefixType.stats.finished), false);
-      await cdp.send('Input.insertText', { text: '日本' });
-      assert.equal(await page.evaluate(() => PrefixType.stats.finished), true); await cdp.detach();
+      assert.equal(await page.evaluate(() => PrefixType.editor.composing), true);
+      assert.equal(await page.evaluate(() => PrefixType.stats.finished), true);
+      const snapshot = () => page.evaluate(async () => {
+        await PrefixType.flush();
+        const sessions = await PrefixType.getAllSessions();
+        const session = sessions.at(-1);
+        return { session, events: await PrefixType.getEventsForSession(session.id), stats: PrefixType.stats };
+      });
+      const completed = await snapshot();
+      assert.equal(completed.session.r, 'completed');
+      assert(completed.session.z);
+      let replay = completed.session.initialText || '';
+      for (const e of completed.events) replay = replay.slice(0, e.p) + e.i + replay.slice(e.p + e.d);
+      assert.equal(replay, '日本');
+      await cdp.send('Input.imeSetComposition', { text: '日本語', selectionStart: 3, selectionEnd: 3 });
+      await cdp.send('Input.insertText', { text: '日本語' });
+      assert.deepEqual(await snapshot(), completed);
+      assert.equal(await page.locator('#status').textContent(), 'Complete');
+      assert.equal(await page.locator('#finished').evaluate(el => el.classList.contains('show')), true);
+      await cdp.detach();
     });
     await run('daily export clips midnight/DST and recovery closes interrupted sessions', async () => {
       const zone = await browser.newContext({ timezoneId: 'America/New_York' });

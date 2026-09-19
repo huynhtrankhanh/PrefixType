@@ -218,8 +218,7 @@
         this.commandDepth--;
         if (!this.commandDepth && this.pendingCompositionCommit) {
           this.pendingCompositionCommit = false;
-          // Completion observes the result of the command, not a transient
-          // matching composition just before Enter/Delete/Undo changes it.
+          // Notify observers after the command has updated text and selection.
           this.dispatchEvent(new Event('compositioncommit'));
         }
       }
