@@ -205,12 +205,19 @@
       this.commandDepth++;
       try {
         if (this.composing) {
-          // Changing only updateSelection does not end Chromium's composition:
-          // subsequent IME text can still replace the old range. Deactivate the
-          // context to commit its displayed text, then reattach without moving
-          // DOM focus.
-          try { this.element.editContext = null; }
-          finally { this.element.editContext = this.editContext; }
+          // Detaching EditContext only clears the renderer's composition. The
+          // OS IME can retain its preedit and insert it again at the new caret.
+          // A DOM focus change also tells Chromium to reset the platform IME.
+          // Blur commits the displayed draft; restore focus synchronously so
+          // the command and subsequent input still target this editor.
+          if (document.activeElement === this.element) {
+            this.element.blur();
+            this.element.focus({ preventScroll: true });
+          } else {
+            // Do not steal focus for a programmatic edit of an inactive editor.
+            try { this.element.editContext = null; }
+            finally { this.element.editContext = this.editContext; }
+          }
           this.compositionEnded();
         }
         return action();

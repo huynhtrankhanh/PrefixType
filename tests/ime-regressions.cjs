@@ -55,7 +55,7 @@ const serve = require('./server.cjs');
       return { text: e.value, anchor: e.model.anchor, focus: e.model.focus,
         composing: e.composing, context: e.editContext.text, focused: e.hasFocus };
     });
-    await check('Enter commits draft and inserts once without blur or clearing pixels', async () => {
+    await check('Enter resets platform focus and inserts once without clearing pixels', async () => {
       await compose('日本');
       await page.evaluate(() => {
         const e = PrefixType.editor; e.paint(); window.editorBlurs = 0;
@@ -67,12 +67,13 @@ const serve = require('./server.cjs');
       assert.deepEqual(await page.evaluate(() => {
         const e = PrefixType.editor;
         return [window.editorBlurs, e.ctx.getImageData(0, 0, e.element.width, e.element.height).data.some((v, i) => i % 4 === 3 && v)];
-      }), [0, true]);
+      }), [1, true]);
       await compose('語');
       assert.equal(await value(), '日本\n語');
     });
-    for (const key of ['ArrowLeft', 'ArrowRight', 'Control+Shift+ArrowLeft', 'Control+Shift+ArrowRight',
-      'Shift+ArrowLeft', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown', 'Backspace', 'Delete', 'Control+z']) {
+    for (const key of ['ArrowLeft', 'ArrowRight', 'Control+ArrowLeft', 'Control+ArrowRight',
+      'Control+Shift+ArrowLeft', 'Control+Shift+ArrowRight', 'Shift+ArrowLeft', 'Shift+ArrowRight',
+      'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown', 'Backspace', 'Delete', 'Control+z']) {
       await check(`active composition executes ${key} like committed text`, async () => {
         const text = 'first line\n日本 words';
         await compose(text, 14);
