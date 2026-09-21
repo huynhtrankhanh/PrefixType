@@ -71,9 +71,7 @@ const serve = require('./server.cjs');
       await compose('語');
       assert.equal(await value(), '日本\n語');
     });
-    for (const key of ['ArrowLeft', 'ArrowRight', 'Control+ArrowLeft', 'Control+ArrowRight',
-      'Control+Shift+ArrowLeft', 'Control+Shift+ArrowRight', 'Shift+ArrowLeft', 'Shift+ArrowRight',
-      'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown', 'Backspace', 'Delete', 'Control+z']) {
+    for (const key of ['Backspace', 'Delete', 'Control+z']) {
       await check(`active composition executes ${key} like committed text`, async () => {
         const text = 'first line\n日本 words';
         await compose(text, 14);
@@ -90,6 +88,48 @@ const serve = require('./server.cjs');
         assert.equal(await value(), expected.text.slice(0, start) + '語' + expected.text.slice(end));
       });
     }
+    for (const key of ['ArrowLeft', 'ArrowRight', 'Control+ArrowLeft', 'Control+ArrowRight',
+      'Control+Shift+ArrowLeft', 'Control+Shift+ArrowRight', 'Shift+ArrowLeft', 'Shift+ArrowRight',
+      'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown', 'Control+a']) {
+      await check(`navigation preserves composition and replacement range: ${key}`, async () => {
+        await page.evaluate(() => { const e = PrefixType.editor; e.insert('before \nafter'); e.select(7); });
+        await compose('tiếng');
+        const before = await state();
+        // Learn the editor's normal caret movement using committed text.
+        await cdp.send('Input.insertText', { text: 'tiếng' });
+        await page.keyboard.press(key);
+        const moved = await state();
+        await reset();
+        await page.evaluate(() => { const e = PrefixType.editor; e.insert('before \nafter'); e.select(7); });
+        await compose('tiếng');
+        await page.evaluate(() => {
+          window.navigationBlurs = 0;
+          PrefixType.editor.element.onblur = () => window.navigationBlurs++;
+          window.navigationContext = PrefixType.editor.editContext;
+        });
+        await page.keyboard.press(key);
+        assert.deepEqual(await state(), { ...moved, composing: true });
+        assert.deepEqual(await page.evaluate(() => [window.navigationBlurs,
+          PrefixType.editor.element.editContext === window.navigationContext]), [0, true]);
+        // Model V7's full-preedit resend after selection changes. Do not pass
+        // an explicit replacement range: the browser must retain the old one.
+        await compose('tiếng');
+        assert.equal(await value(), before.text);
+        await compose('tiến');
+        assert.equal(await value(), 'before tiến\nafter');
+        await cdp.send('Input.insertText', { text: 'tiến' });
+        assert.equal((await state()).composing, false);
+        await page.keyboard.press('Control+z');
+        assert.equal(await value(), 'before \nafter');
+        await page.keyboard.press('Control+Shift+z');
+        assert.equal(await value(), 'before tiến\nafter');
+        // An identical word in a NEW composition is real input, not a resend.
+        await page.evaluate(() => PrefixType.editor.select(11));
+        await compose('tiến');
+        await cdp.send('Input.insertText', { text: 'tiến' });
+        assert.equal(await value(), 'before tiếntiến\nafter');
+      });
+    }
     await check('named composing keys act; unknown IME keys retain the draft', async () => {
       await compose('日本');
       for (const key of ['Process', 'Unidentified', 'a']) {
@@ -98,6 +138,12 @@ const serve = require('./server.cjs');
         })), key), true);
         assert.equal((await state()).composing, true);
       }
+      assert.equal(await page.evaluate(() => PrefixType.editor.element.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'ArrowLeft', keyCode: 229, isComposing: true, bubbles: true, cancelable: true
+      }))), false);
+      assert.equal((await state()).composing, true);
+      assert.equal((await state()).focus, 1);
+      await compose('日本');
       assert.equal(await page.evaluate(() => PrefixType.editor.element.dispatchEvent(new KeyboardEvent('keydown', {
         key: 'Enter', keyCode: 229, isComposing: true, bubbles: true, cancelable: true
       }))), false);
@@ -112,14 +158,23 @@ const serve = require('./server.cjs');
       assert.equal(await value(), '日本\n');
       assert.equal((await state()).composing, false);
     });
-    await check('selection and reset discard stale native composition ranges', async () => {
+    await check('selection preserves the live composition; reset discards it', async () => {
       await compose('日本');
       await page.evaluate(() => PrefixType.editor.select(1));
       await compose('語');
-      assert.equal(await value(), '日語本');
+      assert.equal(await value(), '語');
       await reset();
       await compose('new');
       assert.equal(await value(), 'new');
+    });
+    await check('IME cancellation after navigation removes only its original draft', async () => {
+      await page.evaluate(() => { const e = PrefixType.editor; e.insert('before  after'); e.select(7); });
+      await compose('tiếng');
+      await page.keyboard.press('Control+ArrowLeft');
+      await compose('');
+      assert.equal(await value(), 'before  after');
+      assert.equal((await state()).composing, false);
+      assert.equal((await state()).context, 'before  after');
     });
     await check('matching draft completes immediately and Enter preserves terminal completion', async () => {
       await page.evaluate(() => { PrefixType.reset('日本'); PrefixType.editor.focus(); });

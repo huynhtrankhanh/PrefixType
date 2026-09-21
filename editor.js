@@ -296,7 +296,9 @@
       to.push(entry);
     }
     select(anchor, focus = anchor, reveal = true) {
-      if (this.composing) return this.runCommand(() => this.select(anchor, focus, reveal));
+      // Selection changes must leave the IME's replacement range alive.
+      // The IME may resend its full draft before ending composition in response
+      // to the new selection; blurring here would turn that into an insertion.
       this.model.select(anchor, focus);
       this.editContext?.updateSelection(this.model.start, this.model.end);
       if (reveal) this.reveal();
@@ -333,7 +335,11 @@
       const newline = key === 'Enter' && !command && !event.altKey;
       if (!shortcut && !navigation.includes(key) && !['Backspace', 'Delete'].includes(key) && !newline) return;
       event.preventDefault();
-      this.runCommand(() => this.editingKey(event, newline));
+      if (navigation.includes(key) || (command && key.toLowerCase() === 'a')) {
+        this.editingKey(event, newline);
+      } else {
+        this.runCommand(() => this.editingKey(event, newline));
+      }
     }
     editingKey(event, newline) {
       if (newline) { this.insert('\n'); return; }

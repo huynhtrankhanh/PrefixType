@@ -1,5 +1,6 @@
 // Run via npm run test:ime:native. Unlike CDP composition injection, IBus keeps
-// a real preedit buffer outside the renderer, exposing incomplete IME resets.
+// a real preedit buffer outside the renderer. Compare against a native textarea
+// rather than assuming an arrow must commit the OS-owned composition.
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
 const { chromium } = require('playwright');
@@ -19,63 +20,79 @@ const serve = require('./server.cjs');
     const windows = execFileSync('xdotool', ['search', '--onlyvisible', '--class', 'chromium'])
       .toString().trim().split('\n');
     execFileSync('xdotool', ['windowfocus', windows.at(-1)]);
+    await page.evaluate(() => {
+      const e = PrefixType.editor;
+      for (const input of [e.editContext, e.nativeInput]) {
+        input.addEventListener('compositionstart', () => window.imeComposing = true);
+        input.addEventListener('compositionend', () => window.imeComposing = false);
+        input.addEventListener(input === e.editContext ? 'textupdate' : 'input', () => window.imeUpdates++);
+      }
+      e.element.addEventListener('blur', () => window.imeBlurs++);
+      e.nativeInput.addEventListener('blur', () => window.imeBlurs++);
+    });
     const state = () => page.evaluate(() => {
       const e = PrefixType.editor;
-      return { text: e.value, start: e.selectionStart, end: e.selectionEnd,
-        composing: e.composing, context: e.editContext.text, focused: e.hasFocus };
+      if (!e.nativeMode && e.editContext.text !== e.value) throw new Error('EditContext divergence');
+      return { text: e.value,
+        start: e.nativeMode ? e.nativeInput.selectionStart : e.selectionStart,
+        end: e.nativeMode ? e.nativeInput.selectionEnd : e.selectionEnd,
+        composing: window.imeComposing, focused: e.hasFocus };
     });
-    const reset = () => page.evaluate(() => {
+    const reset = native => page.evaluate(native => {
       const e = PrefixType.editor;
-      e.element.blur();
-      PrefixType.reset('unused target');
-      e.insert('before  after'); e.select(7); e.focus();
-      window.imeUpdates = [];
-      if (!window.imeTracing) {
-        e.editContext.addEventListener('textupdate', event => window.imeUpdates.push(event.text));
-        window.imeTracing = true;
-      }
-    });
+      document.activeElement.blur();
+      PrefixType.reset('unused target'); e.setNativeMode(native);
+      e.insert('before  after'); e.select(7);
+      if (native) e.nativeInput.setSelectionRange(7, 7);
+      e.focus();
+      window.imeUpdates = 0; window.imeBlurs = 0; window.imeComposing = false;
+    }, native);
     const type = async text => {
-      const count = await page.evaluate(() => window.imeUpdates.length);
+      const count = await page.evaluate(() => window.imeUpdates);
       execFileSync('xdotool', ['type', '--clearmodifiers', '--delay', '80', text]);
-      await page.waitForFunction(count => window.imeUpdates.length >= count && PrefixType.editor.composing, count + text.length);
+      await page.waitForFunction(count => window.imeUpdates >= count && window.imeComposing, count + text.length);
     };
-    // Learn the IME's fresh result rather than depending on candidate ranking.
-    await reset(); await type('ni');
-    const fresh = await page.evaluate(() => window.imeUpdates.at(-1));
-    assert(fresh.length > 0);
-    execFileSync('xdotool', ['key', 'Escape']);
-    await page.waitForFunction(() => !PrefixType.editor.composing);
-
+    const commit = async () => {
+      execFileSync('xdotool', ['key', 'space']);
+      await page.waitForFunction(() => !window.imeComposing);
+    };
     for (const key of ['ArrowLeft', 'ArrowRight', 'Control+ArrowLeft', 'Control+ArrowRight',
       'Shift+ArrowLeft', 'Shift+ArrowRight', 'Control+Shift+ArrowLeft', 'Control+Shift+ArrowRight']) {
-      await reset(); await type('nihao');
-      const before = await state();
-      assert.equal(before.composing, true);
-      // Inject the editor command while the OS still owns a live composition.
-      // Physical arrows may be consumed by Pinyin for candidate navigation.
-      await page.keyboard.press(key);
-      const moved = await state();
-      assert.equal(moved.text, before.text, `${key}: draft preserved`);
-      assert.equal(moved.composing, false, `${key}: composition ended`);
-      assert.equal(moved.focused, true, `${key}: focus restored`);
-      await type('ni');
-      const expected = moved.text.slice(0, moved.start) + fresh + moved.text.slice(moved.end);
-      assert.equal((await state()).text, expected, `${key}: old preedit must not be inserted again`);
-      assert.equal((await state()).context, expected);
-      // Commit via the actual IME, then verify the two compositions are separate
-      // undo groups and that replacement selections are restored by undo.
-      execFileSync('xdotool', ['key', 'space']);
-      await page.waitForFunction(() => !PrefixType.editor.composing);
-      assert.equal((await state()).text, expected);
-      await page.keyboard.press('Control+z');
-      assert.equal((await state()).text, before.text);
-      await page.keyboard.press('Control+z');
-      assert.equal((await state()).text, 'before  after');
-      await page.keyboard.press('Control+Shift+z');
-      await page.keyboard.press('Control+Shift+z');
-      assert.equal((await state()).text, expected);
-      console.log('PASS live IBus composition, navigation, continued typing, commit, undo/redo:', key);
+      const run = async native => {
+        await reset(native); await type('nihao');
+        const before = await state();
+        // Physical arrows may be consumed by Pinyin for candidate navigation.
+        // Inject the same editing command into each host while IBus owns preedit.
+        await page.keyboard.press(key);
+        const moved = await state();
+        assert.equal(moved.text, before.text, `${key}: draft preserved`);
+        assert.equal(moved.composing, true, `${key}: IME still owns composition`);
+        assert.equal(moved.focused, true);
+        assert.equal(await page.evaluate(() => window.imeBlurs), 0);
+        await type('ni');
+        const continued = await state();
+        await commit();
+        const committed = await state();
+        assert.equal(committed.text, continued.text);
+        // After a real IME commit, further typing starts a separate group at
+        // the moved caret. This distinguishes a resend from fresh input.
+        await page.keyboard.press('ArrowLeft');
+        await type('ni'); await commit();
+        const next = await state();
+        if (!native) {
+          await page.keyboard.press('Control+z');
+          assert.equal((await state()).text, committed.text);
+          await page.keyboard.press('Control+z');
+          assert.equal((await state()).text, 'before  after');
+          await page.keyboard.press('Control+Shift+z');
+          await page.keyboard.press('Control+Shift+z');
+          assert.equal((await state()).text, next.text);
+        }
+        return { before, moved, continued, committed, next };
+      };
+      const expected = await run(true);
+      assert.deepEqual(await run(false), expected, key);
+      console.log('PASS live IBus navigation, continued composition and commit match native textarea:', key);
     }
     assert.deepEqual(errors, []);
     console.log('Chromium', browser.version());
