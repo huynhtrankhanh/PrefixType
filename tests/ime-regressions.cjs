@@ -169,6 +169,76 @@ const serve = require('./server.cjs');
       assert.equal(result.text, '日本'); assert.equal(result.context, '日本');
       await cdp.send('Input.insertText', { text: '日本' });
     });
+    // Android platform selection, using real Chromium textarea composition.
+    // CDP supplies the setComposingText-style resend V7 makes when selection
+    // changes; it does not simulate an Android InputConnection or OS keyboard.
+    const android = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/145.0.0.0 Mobile Safari/537.36',
+      viewport: { width: 393, height: 851 }, isMobile: true, hasTouch: true
+    });
+    try {
+      const tab = await android.newPage();
+      tab.on('pageerror', error => errors.push(error.message));
+      await tab.goto(server.url);
+      const ime = await android.newCDPSession(tab);
+      const androidState = () => tab.evaluate(() => {
+        const e = PrefixType.editor, n = e.nativeInput;
+        return { text: e.value, start: e.selectionStart, end: e.selectionEnd,
+          native: n.value, nativeStart: n.selectionStart, nativeEnd: n.selectionEnd };
+      });
+      for (const key of ['ArrowLeft', 'ArrowRight', 'Shift+ArrowLeft', 'Control+ArrowLeft']) {
+        const run = async native => {
+          await tab.evaluate(native => {
+            const e = PrefixType.editor;
+            PrefixType.reset('unused target'); e.setNativeMode(native);
+            e.insert('before  after'); e.select(7); e.focus();
+            window.androidBlurs = 0;
+            e.nativeInput.onblur = () => window.androidBlurs++;
+          }, native);
+          await ime.send('Input.imeSetComposition', { text: 'tiếng', selectionStart: 5, selectionEnd: 5 });
+          await tab.keyboard.press(key);
+          await tab.waitForFunction(() => {
+            const e = PrefixType.editor;
+            return e.selectionStart === e.nativeInput.selectionStart && e.selectionEnd === e.nativeInput.selectionEnd;
+          });
+          const moved = await androidState();
+          // Resending the whole Telex preedit must replace its existing range,
+          // including when it is surrounded by other text.
+          await ime.send('Input.imeSetComposition', { text: 'tiếng', selectionStart: 5, selectionEnd: 5 });
+          await ime.send('Input.insertText', { text: 'tiếng' });
+          const committed = await androidState();
+          assert.equal(committed.text, 'before tiếng after');
+          assert.equal(committed.native, committed.text);
+          assert.equal(await tab.evaluate(() => window.androidBlurs), 0);
+          await tab.keyboard.press('ArrowLeft');
+          await ime.send('Input.imeSetComposition', { text: 'á', selectionStart: 1, selectionEnd: 1 });
+          await ime.send('Input.insertText', { text: 'á' });
+          const continued = await androidState();
+          assert.equal(continued.text, 'before tiếnág after');
+          await tab.keyboard.press('Control+z');
+          assert.equal((await androidState()).text, 'before tiếng after');
+          return { moved, committed, continued };
+        };
+        assert.deepEqual(await run(false), await run(true), key);
+        console.log('PASS Android textarea-backed canvas matches native Telex resend:', key);
+      }
+      await tab.evaluate(() => {
+        const e = PrefixType.editor;
+        e.setNativeMode(false); PrefixType.reset('tiếng'); e.focus();
+      });
+      await ime.send('Input.imeSetComposition', { text: 'tiếng', selectionStart: 5, selectionEnd: 5 });
+      assert.equal(await tab.evaluate(() => PrefixType.stats.finished), true);
+      assert.deepEqual(await tab.evaluate(() => {
+        const e = PrefixType.editor; e.paint();
+        return [e.nativeMode, e.element.hidden, e.hasFocus,
+          e.ctx.getImageData(0, 0, e.element.width, e.element.height).data.some((v, i) => i % 4 === 3 && v)];
+      }), [false, false, true, true]);
+      await ime.send('Input.insertText', { text: 'tiếng' });
+      await tab.keyboard.press('Enter');
+      assert.equal((await androidState()).text, 'tiếng\n');
+      assert.equal(await tab.evaluate(() => PrefixType.stats.finished), true);
+      console.log('PASS Android canvas retains highlighting, draft completion and native Enter');
+    } finally { await android.close(); }
     assert.deepEqual(errors, []);
     assert.deepEqual(failures, []);
   } finally { await browser.close(); await server.close(); }
