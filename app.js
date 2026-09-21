@@ -18,9 +18,10 @@
       const progressBar = document.getElementById("progressBar");
 
       const DB_NAME = "prefixtype-blackbox";
-      const DB_VERSION = 1;
+      const DB_VERSION = 2;
       const SESSION_STORE = "sessions";
       const EVENT_STORE = "events";
+      const SENSOR_STORE = "sensors";
 
       let practiceText = customText.value.replace(/\r\n/g, "\n");
       let startedAt = null;
@@ -34,7 +35,7 @@
       let pagehideContinuation = null;
       let writeChain = Promise.resolve();
       let pendingWrites = [];
-      let writeScheduled = false;
+      let writeTimer = null;
       let storageError = null;
       // A live tab holds this lock. Recovery must not close another tab's session.
       const owner = makeSessionId(Date.now());
@@ -56,6 +57,13 @@
         window.innerHeight,
         window.visualViewport ? window.visualViewport.height : 0
       );
+
+      const sensors = new DeviceRecorder(document.getElementById('sensorIndicator'), sample => {
+        if (!activeSession || storageError) return false;
+        activeSession.c = Math.max(activeSession.c, Date.now());
+        queueRecord(activeSession, { ...sample, sid: activeSession.id, t: activeSession.c }, true);
+        return true;
+      });
 
       const dbPromise = openBlackBoxDb().then(async (db) => {
         await recoverInterruptedSessions(db);
@@ -82,8 +90,17 @@
               events.createIndex("sid", "sid", { unique: false });
               events.createIndex("t", "t", { unique: false });
             }
+            if (!db.objectStoreNames.contains(SENSOR_STORE)) {
+              const samples = db.createObjectStore(SENSOR_STORE, { keyPath: 'k', autoIncrement: true });
+              samples.createIndex('sid', 'sid', { unique: false });
+              samples.createIndex('t', 't', { unique: false });
+            }
           };
-          request.onsuccess = () => resolve(request.result);
+          request.onblocked = () => { status.textContent = 'Close other PrefixType tabs to update storage'; };
+          request.onsuccess = () => {
+            request.result.onversionchange = () => request.result.close();
+            resolve(request.result);
+          };
           request.onerror = () => reject(request.error);
         });
       }
@@ -127,38 +144,43 @@
         }
       }
 
-      function queueRecord(session, event) {
-        pendingWrites.push({ session: { ...session }, event: event && { ...event } });
-        if (!writeScheduled) {
-          writeScheduled = true;
-          writeChain = writeChain.then(async () => {
-            const db = await dbPromise;
-            await ownerReady;
-            const batch = pendingWrites; pendingWrites = []; writeScheduled = false;
-            if (!db) throw new Error("Storage unavailable");
-            const tx = db.transaction([SESSION_STORE, EVENT_STORE], "readwrite");
-            const done = transactionDone(tx);
-            const sessions = new Map();
-            for (const item of batch) {
-              sessions.set(item.session.id, item.session);
-              if (item.event) tx.objectStore(EVENT_STORE).add(item.event);
-            }
-            for (const session of sessions.values()) tx.objectStore(SESSION_STORE).put(session);
-            await done;
-          }).catch(error => {
-            writeScheduled = false; storageError = error;
-            console.error("Black box write failed", error);
-            status.textContent = "Storage error";
-          });
-        }
+      function queueRecord(session, event, sensor = false) {
+        pendingWrites.push({ session: { ...session }, event: event && { ...event }, sensor });
+        // Batch sensor streams instead of opening a transaction for every axis update.
+        if (writeTimer === null) writeTimer = window.setTimeout(flushPending, 100);
         return writeChain;
+      }
+      function flushPending() {
+        if (writeTimer !== null) window.clearTimeout(writeTimer);
+        writeTimer = null;
+        if (!pendingWrites.length) return;
+        const batch = pendingWrites; pendingWrites = [];
+        writeChain = writeChain.then(async () => {
+          const db = await dbPromise;
+          await ownerReady;
+          if (!db) throw new Error('Storage unavailable');
+          const tx = db.transaction([SESSION_STORE, EVENT_STORE, SENSOR_STORE], 'readwrite');
+          const done = transactionDone(tx);
+          const sessions = new Map();
+          for (const item of batch) {
+            sessions.set(item.session.id, item.session);
+            if (item.event) tx.objectStore(item.sensor ? SENSOR_STORE : EVENT_STORE).add(item.event);
+          }
+          for (const session of sessions.values()) tx.objectStore(SESSION_STORE).put(session);
+          await done;
+        }).catch(error => {
+          storageError = error; sensors.setActive(false);
+          console.error('Black box write failed', error);
+          status.textContent = 'Storage error';
+        });
       }
       const putSession = session => queueRecord(session);
       const putDelta = (session, event) => queueRecord(session, event);
       async function flushWrites() {
-        // New input can enqueue another batch while a transaction is in flight.
-        let current;
-        do { current = writeChain; await current; } while (current !== writeChain);
+        // Flush through this call's boundary; a continuous sensor stream must
+        // not keep exports waiting forever for the next sample.
+        flushPending();
+        await writeChain;
         if (storageError) throw storageError;
       }
 
@@ -184,6 +206,17 @@
         return result;
       }
 
+      async function getSensorSamplesForSession(sessionId) {
+        await flushWrites();
+        const db = await dbPromise;
+        if (!db) return [];
+        const tx = db.transaction(SENSOR_STORE, 'readonly');
+        const done = transactionDone(tx);
+        const samples = await requestResult(tx.objectStore(SENSOR_STORE).index('sid').getAll(IDBKeyRange.only(sessionId)));
+        await done;
+        return samples.sort((a, b) => a.k - b.k);
+      }
+
       function makeSessionId(now) {
         if (crypto.randomUUID) return `${now.toString(36)}-${crypto.randomUUID()}`;
         const bytes = crypto.getRandomValues(new Uint32Array(4));
@@ -207,6 +240,7 @@
           o: new Date(at).getTimezoneOffset()
         };
         pagehideContinuation = null;
+        sensors.setActive(!storageError);
         putSession(activeSession);
         recorderCheckpointId = window.setInterval(() => {
           if (!activeSession) return;
@@ -226,6 +260,7 @@
         }
         putSession(activeSession);
         activeSession = null;
+        sensors.setActive(false);
         if (recorderCheckpointId !== null) {
           window.clearInterval(recorderCheckpointId);
           recorderCheckpointId = null;
@@ -452,17 +487,23 @@
         const db = await dbPromise;
         if (!db) throw new Error("Storage unavailable");
         // Sessions and events must come from the same IndexedDB snapshot.
-        const tx = db.transaction([SESSION_STORE, EVENT_STORE], "readonly");
+        const tx = db.transaction([SESSION_STORE, EVENT_STORE, SENSOR_STORE], "readonly");
         const done = transactionDone(tx);
         const sessionRequest = requestResult(tx.objectStore(SESSION_STORE).getAll());
         const eventRequest = requestResult(tx.objectStore(EVENT_STORE).getAll());
-        const [sessions, allEvents] = await Promise.all([sessionRequest, eventRequest]);
+        const sensorRequest = requestResult(tx.objectStore(SENSOR_STORE).getAll());
+        const [sessions, allEvents, allSamples] = await Promise.all([sessionRequest, eventRequest, sensorRequest]);
         await done;
         const snapshotAt = Date.now();
         const eventsBySession = new Map();
         for (const event of allEvents) {
           if (!eventsBySession.has(event.sid)) eventsBySession.set(event.sid, []);
           eventsBySession.get(event.sid).push(event);
+        }
+        const samplesBySession = new Map();
+        for (const sample of allSamples) {
+          if (!samplesBySession.has(sample.sid)) samplesBySession.set(sample.sid, []);
+          samplesBySession.get(sample.sid).push(sample);
         }
         const bounds = dayBounds(dayKey);
         const today = localDayKey(snapshotAt);
@@ -489,21 +530,24 @@
             }
           }
 
+          const samples = (samplesBySession.get(session.id) || []).filter(sample =>
+            sample.t >= fragmentStart && sample.t < recordEnd && sample.t <= fragmentEnd).sort((a, b) => a.k - b.k);
           const startsInside = session.a >= bounds.start && session.a < recordEnd;
-          if (fragmentEnd <= fragmentStart && !startsInside && !fragmentEvents.length) continue;
+          if (fragmentEnd <= fragmentStart && !startsInside && !fragmentEvents.length && !samples.length) continue;
 
           fragments.push({
             session,
             fragmentStart,
             fragmentEnd,
             initialValue,
-            events: fragmentEvents
+            events: fragmentEvents,
+            samples
           });
           accumulatedMs += Math.max(0, fragmentEnd - fragmentStart);
         }
 
         return {
-          version: 3,
+          version: 4,
           dayKey,
           timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
           dayStart: bounds.start,
@@ -679,6 +723,7 @@
 
       window.addEventListener("pagehide", () => {
         finalizeRecording("pagehide");
+        flushPending();
         releaseOwner?.();
       });
       window.addEventListener("pageshow", event => {
@@ -704,7 +749,7 @@
       window.PrefixType = {
         editor: typingInput,
         flush: flushWrites,
-        getAllSessions, getEventsForSession, buildDailyRecord, encodePtbox,
+        getAllSessions, getEventsForSession, getSensorSamplesForSession, buildDailyRecord, encodePtbox,
         reset: (text = practiceText) => { practiceText = text; customText.value = text; resetSession({ focus: false }); },
         finalize: finalizeRecording,
         get stats() { return { totalInserted, correctInserted, finished: finishedAt !== null }; }

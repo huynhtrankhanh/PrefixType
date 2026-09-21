@@ -82,6 +82,27 @@
       font-weight: 750;
     }
 
+    .sensor-strip {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      width: 100%;
+      z-index: 4;
+      min-height: 22px;
+      padding: 2px 8px;
+      border: 0;
+      border-radius: 0;
+      font-size: 11px;
+      background: #eef0ff;
+      color: #3847b2;
+    }
+    .sensor-strip[data-recording="true"] {
+      background: #e1f4e9;
+      color: #09663b;
+      opacity: 1;
+      cursor: default;
+    }
+
     button {
       min-height: 36px;
       border: 1px solid var(--line);
@@ -507,6 +528,7 @@
           <button type="button" data-action="all">Select all</button>
         </div>
         <div id="finished" class="finished">Finished 🎉</div>
+        <button id="sensorIndicator" class="sensor-strip" type="button" aria-live="polite" hidden></button>
       </div>
     </section>
   </main>
@@ -514,6 +536,7 @@
   <script src="vendor/bidi.js"></script>
   <script src="editor.js"></script>
   <script src="ptbox.js"></script>
+  <script src="sensors.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

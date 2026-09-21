@@ -6,6 +6,7 @@
     "test:browser": "node tests/browser.cjs",
     "test:ime": "node tests/ime-regressions.cjs",
     "test:ime:native": "bash tests/native-ime.sh",
+    "test:sensors": "node tests/sensors-browser.cjs",
     "test:traces": "node scripts/validate-traces.cjs",
     "benchmark": "node tests/benchmark.cjs && node tests/trace-benchmark.cjs",
     "download:traces": "python3 scripts/download-traces.py"

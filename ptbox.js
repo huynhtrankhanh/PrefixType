@@ -2,6 +2,7 @@
  * for transient IME lone surrogates. v3 uses UTF-16LE and adds explicit
  * session linkage immediately after each session ID: u8 0=legacy unknown,
  * 1=independent session, 2=continued session followed by predecessor ID string.
+ * v4 appends timestamped device sensor samples after each fragment's edits.
  * Offsets/deletion counts are UTF-16 code units in all versions. */
 (function (root) {
   'use strict';
@@ -88,9 +89,28 @@
     return all;
   }
   const hasLinkage = session => Object.hasOwn(session, 'previousSessionId');
-  function encode(record, version = record.fragments.some(f => hasLinkage(f.session)) ? 3 :
-    record.version ?? (strings(record).every(wellFormed) ? 1 : 2)) {
-    if (![1, 2, 3].includes(version)) throw new Error('Unsupported PTBOX version');
+  const sensorTypes = ['motion', 'orientation', 'orientationabsolute'];
+  const sensorFields = {
+    motion: ['accelerationX', 'accelerationY', 'accelerationZ', 'gravityX', 'gravityY', 'gravityZ',
+      'rotationAlpha', 'rotationBeta', 'rotationGamma', 'interval'],
+    orientation: ['alpha', 'beta', 'gamma', 'webkitCompassHeading', 'webkitCompassAccuracy']
+  };
+  sensorFields.orientationabsolute = sensorFields.orientation;
+  const sampleFields = sample => ['timeStamp', 'screenAngle', ...(sensorFields[sample.type] || [])];
+  function validateSample(sample) {
+    if (!sensorTypes.includes(sample.type)) throw new Error('Invalid sensor type');
+    if (!Number.isFinite(sample.t)) throw new Error('Invalid sensor time');
+    for (const field of sampleFields(sample)) {
+      if (sample[field] !== null && !Number.isFinite(sample[field])) throw new Error('Invalid sensor field ' + field);
+    }
+    if (sample.type !== 'motion' && sample.absolute !== null && typeof sample.absolute !== 'boolean') throw new Error('Invalid absolute flag');
+    if (sample.type === 'motion' && sample.interval !== null && sample.interval < 0) throw new Error('Invalid sensor interval');
+  }
+  function encode(record, version = record.fragments.some(f => f.samples?.length) ? 4 :
+    Math.max(record.version ?? 1, record.fragments.some(f => hasLinkage(f.session)) ? 3 :
+      (strings(record).every(wellFormed) ? 1 : 2))) {
+    if (![1, 2, 3, 4].includes(version)) throw new Error('Unsupported PTBOX version');
+    if (version < 4 && record.fragments.some(f => f.samples?.length)) throw new Error('PTBOX v1/v2/v3 cannot preserve sensor samples');
     if (version < 3 && record.fragments.some(f => hasLinkage(f.session))) throw new Error('PTBOX v1/v2 cannot preserve session linkage');
     if (version === 1 && !strings(record).every(wellFormed)) throw new Error('PTBOX v1 cannot preserve lone surrogates');
     const w = new Writer(version); w.bytes([80, 84, 66, 79, 88]); w.u8(version);
@@ -99,7 +119,7 @@
     for (const f of record.fragments) {
       const s = f.session;
       w.string(s.id);
-      if (version === 3) {
+      if (version >= 3) {
         if (!hasLinkage(s)) w.u8(0);
         else if (s.previousSessionId === null) w.u8(1);
         else {
@@ -111,19 +131,28 @@
       w.string(s.r || ''); w.string(s.q || ''); w.f64(Number.isFinite(s.o) ? s.o : NaN);
       w.string(s.x || ''); w.string(f.initialValue); w.uint(f.events.length);
       for (const e of f.events) { w.f64(e.t); w.uint(e.p); w.uint(e.d); w.string(e.i); w.uint(e.s); w.uint(e.e); }
+      if (version >= 4) {
+        w.uint(f.samples?.length || 0);
+        for (const sample of f.samples || []) {
+          validateSample(sample);
+          w.u8(sensorTypes.indexOf(sample.type) + 1); w.f64(sample.t);
+          for (const field of sampleFields(sample)) w.f64(sample[field] === null ? NaN : sample[field]);
+          if (sample.type !== 'motion') w.u8(sample.absolute === null ? 0 : sample.absolute ? 2 : 1);
+        }
+      }
     }
     return w.finish();
   }
   function decode(bytes) {
     const r = new Reader(bytes);
     if (String.fromCharCode(...r.take(5)) !== 'PTBOX') throw new Error('Invalid PTBOX signature');
-    r.version = r.u8(); if (![1, 2, 3].includes(r.version)) throw new Error('Unsupported PTBOX version');
+    r.version = r.u8(); if (![1, 2, 3, 4].includes(r.version)) throw new Error('Unsupported PTBOX version');
     const record = { version: r.version, exportedAt: r.f64(), dayKey: r.string(), timeZone: r.string(),
       dayStart: r.f64(), dayEnd: r.f64(), accumulatedMs: r.f64(), fragments: [] };
     const count = r.count();
     for (let i = 0; i < count; i++) {
       const session = { id: r.string() };
-      if (r.version === 3) {
+      if (r.version >= 3) {
         const kind = r.u8();
         if (kind === 1) session.previousSessionId = null;
         else if (kind === 2) {
@@ -138,6 +167,24 @@
       f.initialValue = r.string(); f.events = [];
       const n = r.count();
       for (let j = 0; j < n; j++) f.events.push({ t: r.f64(), p: r.uint(), d: r.uint(), i: r.string(), s: r.uint(), e: r.uint() });
+      if (r.version >= 4) {
+        f.samples = [];
+        const count = r.count();
+        for (let j = 0; j < count; j++) {
+          const type = sensorTypes[r.u8() - 1];
+          if (!type) throw new Error('Invalid sensor type');
+          const sample = { type, t: r.f64() };
+          for (const field of sampleFields(sample)) {
+            const value = r.f64(); sample[field] = Number.isNaN(value) ? null : value;
+          }
+          if (type !== 'motion') {
+            const flag = r.u8();
+            if (flag > 2) throw new Error('Invalid absolute flag');
+            sample.absolute = flag === 0 ? null : flag === 2;
+          }
+          validateSample(sample); f.samples.push(sample);
+        }
+      }
       record.fragments.push(f);
     }
     if (r.at !== r.bytes.length) throw new Error('Trailing PTBOX bytes');
@@ -194,6 +241,12 @@
           f.fragmentEnd > record.dayEnd || (s.z !== null && (s.z < s.a || f.fragmentEnd > s.z))) errors.push('Invalid fragment interval ' + s.id);
       accumulated += f.fragmentEnd - f.fragmentStart;
       eventCount += f.events.length;
+      let lastSampleTime = f.fragmentStart;
+      for (const sample of f.samples || []) {
+        try { validateSample(sample); } catch (error) { errors.push(s.id + ': ' + error.message); }
+        if (sample.t < lastSampleTime || sample.t > f.fragmentEnd || sample.t >= record.dayEnd) errors.push('Invalid sensor time ' + s.id);
+        lastSampleTime = sample.t;
+      }
       const initial = initialState(f, previous);
       if (initial.continued) continuations++;
       let text = initial.text, lastTime = f.fragmentStart, replayValid = true;

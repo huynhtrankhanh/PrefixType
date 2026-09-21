@@ -101,14 +101,15 @@ Separately, the canvas editor replayed all **187,436 events** across **203 sessi
 
 ## Database and trace format
 
-The existing IndexedDB database remains `prefixtype-blackbox`, schema version **1**. Existing records remain readable.
+The existing IndexedDB database remains `prefixtype-blackbox`, schema version **2**, which adds a `sensors` store without rewriting existing sessions or text events. Existing records remain readable.
 
 | Store | Fields |
 | --- | --- |
 | `sessions`, key `id` | `a`: start; `z`: end or null; `c`: checkpoint; `r`: end reason; `x`: practice text; `q`: time zone; `o`: UTC offset minutes; optional `owner`: live-tab identity; `previousSessionId`: pagehide predecessor or null; `initialText`: session starting text |
 | `events`, auto-increment key `k` | `sid`: session ID; `t`: timestamp; `p`: replacement offset; `d`: deleted code units; `i`: inserted string; `s`, `e`: resulting selection start/end |
+| `sensors`, auto-increment key `k` | `sid`: session ID; `t`: receipt time clamped to the session checkpoint; `type`: motion/orientation/orientationabsolute; `timeStamp`: browser event timestamp; `screenAngle`; sensor fields described below |
 
-Session metadata and its deltas are written in the same transaction. Writes queued together are batched, and daily exports read sessions and events in one consistent transaction. Checkpoints occur every five seconds. Interrupted sessions recover to their last checkpoint. Where Web Locks are available, recovery skips sessions owned by a live tab; the tab releases its lock on pagehide and reacquires it on restoration. Storage failures are reported and prevent a misleading successful export.
+Session metadata, text deltas, and sensor samples are written in the same transaction. Writes are batched for up to 100 ms; reads/exports flush through their invocation boundary, and pagehide flushes the pending batch immediately. Daily exports read all three stores in one consistent transaction. A continuous sensor stream does not prevent an export from completing. Checkpoints occur every five seconds. Interrupted sessions recover to their last checkpoint. Where Web Locks are available, recovery skips sessions owned by a live tab; the tab releases its lock on pagehide and reacquires it on restoration. Storage failures are reported and prevent a misleading successful export.
 
 Daily records use browser-local midnight boundaries, including 23- or 25-hour DST days. Today's export ends at its snapshot time. A fragment includes edits in that day window and its state reconstructed from `initialText` plus earlier edits. Day windows are half-open: an edit exactly at midnight belongs only to the next day's file, retaining the same session ID. Session reasons remain `completed`, `restarted`, `practice-text-changed`, `pagehide`, and `recovered`.
 
@@ -116,13 +117,14 @@ Daily records use browser-local midnight boundaries, including 23- or 25-hour DS
 
 The binary codec is available as `window.Ptbox` in the browser and `require('./ptbox.js')` in Node.
 
-All timestamps are little-endian Float64 Unix epoch milliseconds. Integers are unsigned LEB128-style varints, bounded to JavaScript safe integers. Each string starts with its **byte** length.
+Session, export, edit, and sample `t` timestamps are little-endian Float64 Unix epoch milliseconds. Sensor `timeStamp` retains the browser event timestamp in milliseconds relative to its document time origin; it is not a Unix timestamp. Integers are unsigned LEB128-style varints, bounded to JavaScript safe integers. Each string starts with its **byte** length.
 
 - **Version 1:** strings use UTF-8, preserving compatibility with the supplied files and existing readers.
 - **Version 2:** strings use UTF-16LE, preserving unpaired surrogates that UTF-8/TextEncoder would replace with U+FFFD. Other fields match v1.
-- **Version 3:** current app exports use UTF-16LE and add explicit session linkage after each session ID. Fragment initial text makes new continuation sessions independently replayable. Readers limited to v1/v2 must add v3 support.
+- **Version 3:** UTF-16LE with explicit session linkage after each session ID. Fragment initial text makes new continuation sessions independently replayable.
+- **Version 4:** current app exports retain v3 text/linkage encoding and append a sensor sample stream to every fragment. Old readers must add v4 support to read new exports.
 
-The decoder accepts all three versions. The codec preserves the version of decoded legacy records unless linkage is added; it refuses to export explicit linkage as v1/v2 rather than silently discarding it. Old sessions mixed into a v3 export retain an explicit "linkage unknown" tag, so no predecessor is fabricated.
+The decoder accepts versions 1–4. Automatic encoding upgrades to v4 when samples are present and preserves decoded v4 files even when their sample streams are empty. Explicit export to versions 1–3 rejects sensor data rather than dropping it; explicit export to versions 1–2 also rejects linkage. Old sessions retain an explicit "linkage unknown" tag, so no predecessor is fabricated.
 
 Header field order:
 
@@ -132,10 +134,15 @@ Header field order:
 
 For each fragment:
 
-1. Session ID; **v3 only:** one linkage byte (`0`: legacy/unknown, `1`: independent session, `2`: continuation). For tag `2`, a nonempty predecessor-ID string follows. Then original start and original end (`NaN` while open).
+1. Session ID; **v3/v4:** one linkage byte (`0`: legacy/unknown, `1`: independent session, `2`: continuation). For tag `2`, a nonempty predecessor-ID string follows. Then original start and original end (`NaN` while open).
 2. Clipped fragment start/end; end reason; session time zone; offset minutes.
 3. Practice text; initial fragment text; delta count.
 4. For each delta: timestamp, replacement offset, deletion count, inserted string, selection start, selection end.
+5. **v4 only:** sensor sample count (varint), then the samples in delivery order. Each begins with a type byte (`1`: motion, `2`: orientation, `3`: absolute-orientation event), then Float64 `t`, `timeStamp`, and `screenAngle`.
+6. Motion samples continue with ten Float64 values: `accelerationX/Y/Z`, `gravityX/Y/Z` (acceleration including gravity), `rotationAlpha/Beta/Gamma`, and `interval`.
+7. Orientation samples continue with five Float64 values: `alpha`, `beta`, `gamma`, `webkitCompassHeading`, `webkitCompassAccuracy`, then one absolute-reference byte (`0`: unavailable, `1`: false, `2`: true). The event type and its absolute flag are preserved separately.
+
+For sensor fields, Float64 NaN represents unavailable data and decodes to `null`; finite values, including zero and signed zero, are preserved without quantization. Sample `t` must be finite. Unknown sample types, invalid flags, infinite values, and negative motion intervals are rejected. Samples do not participate in text replay. The auditor checks their ordering and fragment/day bounds. Daily fragments include only their own sensor samples; no previous sensor value is carried forward or fabricated at midnight.
 
 Apply a delta to a JavaScript string as:
 
@@ -143,7 +150,15 @@ Apply a delta to a JavaScript string as:
 value = value.slice(0, event.p) + event.i + value.slice(event.p + event.d);
 ```
 
-New v3 session fragments replay directly from `fragment.initialValue`; use `session.previousSessionId` for linkage, even when the predecessor is in a different file. `Ptbox.initialState(fragment, previous)` retains inference for legacy records only; explicit linkage never depends on file ordering. The validator checks signatures, versions, truncation, varint overflow, UTF encoding, trailing bytes, edit/selection ranges, event ordering, fragment intervals, accumulated durations, completed text, invalid/cyclic predecessor links, and predecessor/initial-text agreement when both complete fragments are available. A trace is a sequence of text changes; it does not contain raw key, pointer, or OS candidate-window events.
+New v3/v4 session fragments replay directly from `fragment.initialValue`; use `session.previousSessionId` for linkage, even when the predecessor is in a different file. `Ptbox.initialState(fragment, previous)` retains inference for legacy records only; explicit linkage never depends on file ordering. The validator checks signatures, versions, truncation, varint overflow, UTF encoding, trailing bytes, edit/selection ranges, event ordering, fragment intervals, accumulated durations, completed text, invalid/cyclic predecessor links, and predecessor/initial-text agreement when both complete fragments are available. A v4 trace includes text changes and any available device sensor samples; it does not contain raw key, pointer, or OS candidate-window events.
+
+### Device motion and orientation recording
+
+Recording starts automatically with the first text edit in a typing session when the browser delivers sensor data. It stops on completion, restart, or pagehide; hidden pages do not record samples. Every delivered event with at least one usable motion/orientation value is retained, without application-level throttling or deduplication. The browser controls its sampling frequency and hardware availability. The thin green strip says **Device sensors recording** while usable samples are arriving; it disappears after two seconds without a sample or immediately when the session stops. All-null events do not light the indicator or create records. Storage failures stop sensor capture and report an error.
+
+On browsers requiring explicit access, the strip offers **Enable motion & orientation recording**. Tapping invokes both available permission APIs during the same user gesture, requesting absolute orientation as well. A partial grant still permits whichever sensors the browser supplies. Denial leaves typing usable and offers a retry; no prompt is triggered automatically. Already-accessible streams are listened to without a tap. Access requires a secure context (HTTPS or localhost), supporting hardware, and browser/embedding permissions. Physical iOS permission dialogs and hardware have not been tested; permission flow is covered by browser simulations.
+
+Data includes linear acceleration and acceleration including gravity (m/s²), rotation rate (degrees/s), alpha/beta/gamma orientation (degrees), relative/absolute reference, browser-supplied compass heading/accuracy, motion interval (ms), screen rotation angle, and event timestamps. Values remain in the browser's device coordinate system. This captures the exposed [Device Orientation and Motion API](https://www.w3.org/TR/orientation-event/) data, including optional Safari compass fields, rather than estimating physical position or fabricating unavailable axes. Samples remain local in IndexedDB and are included in downloaded PTBOX files.
 
 ## Tests and reproduction
 
@@ -155,6 +170,7 @@ npx playwright install --with-deps chromium
 npm test
 npm run test:ime
 npm run test:browser
+npm run test:sensors
 ```
 
 On the Ubuntu 26.04 sandbox used for these measurements, Playwright 1.58.2 did not recognize the OS. Its Ubuntu 24.04 browser/dependency package was installed using:
@@ -200,3 +216,5 @@ Canvas word wrapping, complex-script caret geometry, and the application touch m
 The implementation follows the [EditContext specification](https://www.w3.org/TR/edit-context/) and [Chrome's EditContext integration guidance](https://developer.chrome.com/blog/introducing-editcontext-api), including application-managed selection and IME bounds. Lock lifecycle handling follows [Chrome's page lifecycle guidance](https://developer.chrome.com/docs/web-platform/page-lifecycle-api).
 
 PrefixType uses the license in [LICENSE](LICENSE). The vendored bidirectional-text implementation is covered by [its MIT license](vendor/bidi-LICENSE.txt).
+
+Sensor verification includes v4 codec round-trips and malformed/truncated inputs, Chromium virtual motion/orientation sensors, permission grant/denial simulations, database migration, persistence/reload, completion, hidden pages, pagehide continuation, and half-open midnight exports. `test-results/sensor-strip.png` shows the indicator during simulated sensor delivery.

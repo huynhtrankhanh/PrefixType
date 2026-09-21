@@ -171,7 +171,7 @@ const ptbox = require('../ptbox.js');
         return Array.from(PrefixType.encodePtbox(await PrefixType.buildDailyRecord(day)));
       });
       const record = ptbox.decode(Uint8Array.from(exported));
-      assert.equal(record.version, 3);
+      assert.equal(record.version, 4);
       const continued = record.fragments.find(f => f.session.id === sessions.at(-1).id);
       assert.equal(continued.session.previousSessionId, sessions.at(-2).id);
       assert.equal(continued.initialValue, 'abc');
@@ -242,7 +242,7 @@ const ptbox = require('../ptbox.js');
       const tab = await zone.newPage(); await tab.goto(server.url);
       const result = await tab.evaluate(async () => {
         const dayStart = new Date(2026, 2, 8).getTime(), dayEnd = new Date(2026, 2, 9).getTime();
-        const db = await new Promise((resolve, reject) => { const r = indexedDB.open('prefixtype-blackbox', 1); r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
+        const db = await new Promise((resolve, reject) => { const r = indexedDB.open('prefixtype-blackbox', 2); r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
         const tx = db.transaction(['sessions', 'events'], 'readwrite');
         tx.objectStore('sessions').put({ id: 'dst-session', previousSessionId: null, initialText: '', a: dayStart - 1000, c: dayEnd + 1000, z: dayEnd + 1000, r: 'completed', x: 'abc', q: 'America/New_York', o: 300 });
         for (const [t, p, i] of [[dayStart - 500, 0, 'a'], [dayStart + 1000, 1, 'b'], [dayEnd, 2, 'c']]) tx.objectStore('events').add({ sid: 'dst-session', t, p, d: 0, i, s: p + 1, e: p + 1 });
