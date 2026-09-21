@@ -258,18 +258,37 @@
       padding: 0;
       border: 0;
       background: transparent;
-      transform: translate(-50%, -5px);
+      transform: translateX(-50%);
       touch-action: none;
+    }
+    .selection-handle::before {
+      content: "";
+      position: absolute;
+      left: 21px;
+      top: 0;
+      width: 2px;
+      height: 7px;
+      background: var(--accent);
     }
     .selection-handle::after {
       content: "";
-      display: block;
-      width: 20px;
-      height: 24px;
-      margin: -3px auto 0;
-      border-radius: 2px 14px 14px 14px;
+      position: absolute;
+      top: 5px;
+      width: 14px;
+      height: 14px;
       background: var(--accent);
-      transform: rotate(45deg);
+    }
+    .selection-handle[data-edge="start"]::after {
+      right: 21px;
+      border-radius: 50% 0 50% 50%;
+    }
+    .selection-handle[data-edge="end"]::after {
+      left: 21px;
+      border-radius: 0 50% 50% 50%;
+    }
+    .selection-handle[data-caret="true"]::after {
+      left: 15px;
+      border-radius: 50%;
     }
     .selection-handle:hover { background: transparent; }
     .selection-toolbar {
@@ -519,8 +538,8 @@
           aria-label="Type the practice text" aria-multiline="true" spellcheck="false"></canvas>
         <textarea id="nativeInput" class="native-input" aria-label="Type the practice text"
           spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" hidden></textarea>
-        <button class="selection-handle" aria-label="Move selection start" tabindex="-1" hidden></button>
-        <button class="selection-handle" aria-label="Move selection end" tabindex="-1" hidden></button>
+        <button class="selection-handle" data-edge="start" aria-label="Move selection start" tabindex="-1" hidden></button>
+        <button class="selection-handle" data-edge="end" aria-label="Move selection end" tabindex="-1" hidden></button>
         <div id="selectionToolbar" class="selection-toolbar" role="toolbar" aria-label="Text selection" hidden>
           <button type="button" data-action="cut">Cut</button>
           <button type="button" data-action="copy">Copy</button>

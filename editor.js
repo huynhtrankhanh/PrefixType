@@ -629,6 +629,7 @@
       this.handles.forEach((handle, index) => {
         const point = this.point(positions[index]), y = point.y - this.scroll + this.lineHeight;
         handle.hidden = !show || (index === 0 && positions[0] === positions[1]) || y < 0 || y > this.height;
+        handle.dataset.caret = String(positions[0] === positions[1]);
         handle.style.left = `${point.x}px`; handle.style.top = `${y}px`;
       });
       this.toolbar.hidden = !show || !this.touchMenu || !!this.drag;
