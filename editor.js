@@ -650,6 +650,8 @@
     }
     pointerDown(event) {
       if (event.button !== 0) return;
+      // Input modality belongs to this gesture, not to the device or viewport.
+      // A touchscreen attached after page load works on its very first contact.
       event.preventDefault(); this.touchMode = event.pointerType === 'touch'; this.touchMenu = false; this.focus();
       const pos = this.hit(event.clientX, event.clientY);
       this.element.setPointerCapture(event.pointerId);
