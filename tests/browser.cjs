@@ -278,8 +278,7 @@ const ptbox = require('../ptbox.js');
       assert.equal(await tab.evaluate(() => PrefixType.editor.value), 'native'); await fallback.close();
     });
     await run('mobile long press, selection handles, dragging and touch scroll', async () => {
-      const mobile = await browser.newContext({ permissions: ['clipboard-read', 'clipboard-write'], viewport: { width: 393, height: 851 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2,
-        userAgent: 'Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/145.0.0.0 Mobile Safari/537.36' });
+      const mobile = await browser.newContext({ permissions: ['clipboard-read', 'clipboard-write'], viewport: { width: 393, height: 851 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
       const tab = await mobile.newPage(); tab.on('pageerror', error => errors.push(error.message)); await tab.goto(server.url);
       await tab.evaluate(() => { PrefixType.reset('hello world '.repeat(120)); PrefixType.editor.insert('hello world '.repeat(40)); PrefixType.editor.select(0); PrefixType.editor.paint(); });
       const cdp = await mobile.newCDPSession(tab);
@@ -287,11 +286,7 @@ const ptbox = require('../ptbox.js');
       await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ ...point }] });
       await tab.waitForTimeout(520);
       await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
-      assert.deepEqual(await tab.evaluate(() => {
-        const e = PrefixType.editor;
-        return [e.selectionStart, e.selectionEnd, e.nativeInput.selectionStart, e.nativeInput.selectionEnd,
-          e.textareaInput, e.nativeMode, e.hasFocus];
-      }), [0, 5, 0, 5, true, false, true]);
+      assert.deepEqual(await tab.evaluate(() => [PrefixType.editor.selectionStart, PrefixType.editor.selectionEnd]), [0, 5]);
       assert.equal(await tab.locator('.selection-handle:visible').count(), 2);
       assert(await tab.locator('#selectionToolbar').isVisible());
       const handle = await tab.locator('.selection-handle').nth(1).boundingBox();

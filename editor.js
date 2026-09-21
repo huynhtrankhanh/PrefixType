@@ -36,7 +36,7 @@
     }
     return offset;
   }
-  // Used by browser-managed textarea input. EditContext supplies exact deltas.
+  // Only used by the native textarea fallback. EditContext supplies exact deltas.
   function diff(before, after) {
     let p = 0, suffix = 0;
     while (p < before.length && p < after.length && before[p] === after[p]) p++;
@@ -86,15 +86,9 @@
       this.lines = []; this.widths = new Map(); this.scroll = 0; this.frame = 0;
       this.undoStack = []; this.redoStack = []; this.formats = []; this.composing = false; this.revision = 0;
       this.commandDepth = 0; this.pendingCompositionCommit = false;
-      // Android IMEs can resend preedit when selection/focus changes (V7 Telex
-      // does so before finishComposingText). Keep a real textarea's composition
-      // range alive while the canvas renders; a blur/refocus of EditContext
-      // discards that range before Android's asynchronous reply arrives.
-      this.textareaInput = /Android/i.test(navigator.userAgent) || navigator.userAgentData?.platform === 'Android';
-      this.nativeMode = !this.textareaInput && !('EditContext' in root);
-      this.touchMode = false; this.touchMenu = false;
+      this.nativeMode = !('EditContext' in root); this.touchMode = false; this.touchMenu = false;
       this.bidi = root.bidi_js();
-      if (!this.nativeMode && !this.textareaInput) {
+      if (!this.nativeMode) {
         this.editContext = new EditContext();
         canvas.editContext = this.editContext;
         this.editContext.addEventListener('textupdate', event => {
@@ -122,19 +116,13 @@
           nativeInput.selectionDirection === 'backward' ? [nativeInput.selectionEnd, nativeInput.selectionStart] :
             [nativeInput.selectionStart, nativeInput.selectionEnd], { fromNative: true });
       });
-      const nativeSelectionChanged = () => {
-        if (this.nativeMode || this.textareaInput) {
+      nativeInput.addEventListener('select', () => {
+        if (this.nativeMode) {
           this.model.select(nativeInput.selectionDirection === 'backward' ? nativeInput.selectionEnd : nativeInput.selectionStart,
             nativeInput.selectionDirection === 'backward' ? nativeInput.selectionStart : nativeInput.selectionEnd, false);
-          this.reveal(); this.invalidate();
+          this.invalidate();
         }
-      };
-      nativeInput.addEventListener('select', nativeSelectionChanged);
-      // Arrow keys move a collapsed caret without necessarily firing select.
-      document.addEventListener('selectionchange', () => {
-        if (document.activeElement === nativeInput) nativeSelectionChanged();
       });
-      canvas.addEventListener('focus', () => { if (this.textareaInput) this.focus(); });
       for (const el of [canvas, nativeInput]) {
         el.addEventListener('focus', () => { this.dispatchEvent(new Event('focus')); this.invalidate(); });
         el.addEventListener('blur', () => this.invalidate());
@@ -205,8 +193,8 @@
     get selectionStart() { return this.model.start; }
     get selectionEnd() { return this.model.end; }
     get prefix() { return this.model.prefix; }
-    get hasFocus() { return document.activeElement === ((this.nativeMode || this.textareaInput) ? this.nativeInput : this.element); }
-    focus(options = { preventScroll: true }) { ((this.nativeMode || this.textareaInput) ? this.nativeInput : this.element).focus(options); }
+    get hasFocus() { return document.activeElement === (this.nativeMode ? this.nativeInput : this.element); }
+    focus(options = { preventScroll: true }) { (this.nativeMode ? this.nativeInput : this.element).focus(options); }
     compositionEnded() {
       if (!this.composing) return;
       this.composing = false; this.compositionGroup = null; this.formats = []; this.invalidate();
@@ -243,12 +231,8 @@
       }
     }
     setNativeMode(enabled, focus = true) {
-      this.nativeMode = enabled || (!this.editContext && !this.textareaInput);
-      const proxy = this.textareaInput && !this.nativeMode;
-      this.nativeInput.hidden = !this.nativeMode && !proxy; this.element.hidden = this.nativeMode;
-      this.nativeInput.classList.toggle('canvas-input-proxy', proxy);
-      this.element.tabIndex = proxy ? -1 : 0;
-      this.element.setAttribute('aria-hidden', String(proxy));
+      this.nativeMode = enabled || !this.editContext;
+      this.nativeInput.hidden = !this.nativeMode; this.element.hidden = this.nativeMode;
       this.nativeInput.value = this.value;
       this.nativeInput.setSelectionRange(this.model.start, this.model.end, this.model.anchor > this.model.focus ? 'backward' : 'forward');
       if (focus) this.focus();
@@ -282,7 +266,7 @@
         this.editContext.updateText(p, p + d, i);
         this.editContext.updateSelection(this.model.start, this.model.end);
       }
-      if ((this.nativeMode || this.textareaInput) && !options.fromNative) {
+      if (this.nativeMode && !options.fromNative) {
         this.nativeInput.value = this.value;
         this.nativeInput.setSelectionRange(this.model.start, this.model.end);
       }
@@ -315,10 +299,6 @@
       if (this.composing) return this.runCommand(() => this.select(anchor, focus, reveal));
       this.model.select(anchor, focus);
       this.editContext?.updateSelection(this.model.start, this.model.end);
-      if (this.nativeMode || this.textareaInput) {
-        this.nativeInput.setSelectionRange(this.model.start, this.model.end,
-          this.model.anchor > this.model.focus ? 'backward' : 'forward');
-      }
       if (reveal) this.reveal();
       this.invalidate();
     }
@@ -630,7 +610,6 @@
       if (this.hasFocus && this.model.start === this.model.end) {
         ctx.fillStyle = '#172033'; ctx.fillRect(caret.x, caret.y - this.scroll + 3, 1.5, this.lineHeight - 6);
       }
-      if (this.textareaInput) this.nativeInput.scrollTop = this.scroll;
       this.updateBounds(); this.positionHandles();
     }
     updateBounds() {
