@@ -37,6 +37,20 @@ const fs = require('node:fs');
     await emit(page);
     const saved = await samples(page);
     assert.equal(saved.length, 3);
+    const stored = await page.evaluate(async () => {
+      const db = await new Promise((resolve, reject) => {
+        const r = indexedDB.open('prefixtype-blackbox');
+        r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error);
+      });
+      const rows = await new Promise(resolve => {
+        const r = db.transaction('sensors').objectStore('sensors').getAll();
+        r.onsuccess = () => resolve(r.result);
+      });
+      db.close();
+      return rows.map(row => ({ bytes: row.data?.byteLength, samples: Ptbox.decodeSamples(row.data).length }));
+    });
+    assert.equal(stored.reduce((sum, row) => sum + row.samples, 0), 3);
+    assert(stored.every(row => row.bytes > 0));
     assert.equal(saved[0].accelerationX, 0); assert.equal(saved[0].accelerationZ, null);
     assert.equal(saved[0].gravityY, 9.81); assert.equal(saved[1].alpha, 0);
     assert.equal(saved[2].webkitCompassHeading, 270); assert.equal(saved[2].absolute, true);
@@ -61,7 +75,7 @@ const fs = require('node:fs');
       return Array.from(PrefixType.encodePtbox(await PrefixType.buildDailyRecord(key)));
     });
     const record = pt.decode(Uint8Array.from(bytes));
-    assert.equal(record.version, 4); assert.equal(record.fragments[0].samples.length, 3);
+    assert.equal(record.version, 5); assert.equal(record.fragments[0].samples.length, 3);
     assert.deepEqual(pt.audit(record).errors, []);
     assert.equal(record.fragments[0].events.reduce(pt.apply, ''), 'abcdef');
     await page.locator('#records').click();
@@ -72,7 +86,7 @@ const fs = require('node:fs');
     assert.equal(downloaded.fragments[0].samples.length, 3);
     assert.deepEqual(pt.audit(downloaded).errors, []);
     await page.reload(); assert.equal((await samples(page)).length, 3);
-    console.log('PASS sensor persistence, v4 export, text replay, missing values, completion and reload');
+    console.log('PASS sensor persistence, v5 export, text replay, missing values, completion and reload');
 
     await start(page); await emit(page);
     await page.evaluate(() => dispatchEvent(new Event('pagehide')));
@@ -174,23 +188,87 @@ const fs = require('node:fs');
     await start(migration); await emit(migration); assert.equal((await samples(migration)).length, 3);
     console.log('PASS database v1 upgrade preserves legacy sessions and accepts sensor samples');
 
+    const oldSamples = Array.from({ length: 390 }, (_, i) => ({
+      ...saved[i % saved.length], sid: i < 260 ? 'old-a' : 'old-b', t: 1000 + Math.floor(i / 3)
+    })).map(({ k, ...sample }) => sample);
+    const v2Context = await browser.newContext();
+    const v2 = await v2Context.newPage();
+    await v2.route('**/seed.html', route => route.fulfill({ contentType: 'text/html', body: '<!doctype html>' }));
+    await v2.goto(server.url + '/seed.html');
+    await v2.evaluate(async samples => {
+      const db = await new Promise((resolve, reject) => {
+        const r = indexedDB.open('prefixtype-blackbox', 2);
+        r.onupgradeneeded = () => {
+          const store = r.result.createObjectStore('sensors', { keyPath: 'k', autoIncrement: true });
+          store.createIndex('sid', 'sid'); store.createIndex('t', 't');
+          r.result.createObjectStore('sessions', { keyPath: 'id' });
+          const events = r.result.createObjectStore('events', { keyPath: 'k', autoIncrement: true });
+          events.createIndex('sid', 'sid'); events.createIndex('t', 't');
+        };
+        r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error);
+      });
+      const tx = db.transaction(['sensors', 'sessions', 'events'], 'readwrite');
+      for (const sample of samples) tx.objectStore('sensors').add(sample);
+      const before = 'context '.repeat(1000) + 'old tail', after = 'context '.repeat(1000) + 'new tail';
+      tx.objectStore('sessions').put({ id: 'draft', initialText: before, a: 1, z: 3, c: 3, r: 'restarted', x: '' });
+      tx.objectStore('events').add({ sid: 'draft', t: 2, p: 0, d: before.length, i: after, s: 8003, e: 8005 });
+      tx.objectStore('events').add({ sid: 'draft', t: 3, p: 0, d: after.length, i: after, s: 1, e: 2 });
+      tx.objectStore('sessions').put({ id: 'unknown', a: 1, z: 3, c: 3, r: 'pagehide', x: '' });
+      tx.objectStore('events').add({ sid: 'unknown', t: 2, p: 0, d: before.length, i: after, s: 8003, e: 8005 });
+      await new Promise((resolve, reject) => { tx.oncomplete = resolve; tx.onabort = () => reject(tx.error); });
+      db.close();
+    }, oldSamples);
+    await v2.goto(server.url);
+    const migrated = await v2.evaluate(async () => {
+      const a = await PrefixType.getSensorSamplesForSession('old-a');
+      const b = await PrefixType.getSensorSamplesForSession('old-b');
+      const db = await new Promise(resolve => {
+        const r = indexedDB.open('prefixtype-blackbox'); r.onsuccess = () => resolve(r.result);
+      });
+      const rows = await new Promise(resolve => {
+        const r = db.transaction('sensors').objectStore('sensors').getAll(); r.onsuccess = () => resolve(r.result);
+      });
+      const result = { version: db.version, rows: rows.length, compressed: rows.every(row => row.data instanceof Uint8Array),
+        samples: [...a, ...b].map(({ k, ...sample }) => sample) };
+      db.close(); return result;
+    });
+    assert.equal(migrated.version, 3); assert.equal(migrated.rows, 5); assert(migrated.compressed);
+    assert.deepEqual(migrated.samples, oldSamples);
+    const edits = await v2.evaluate(async () => ({
+      known: await PrefixType.getEventsForSession('draft'), unknown: await PrefixType.getEventsForSession('unknown')
+    }));
+    assert.deepEqual(edits.known.map(({ p, d, i, s, e }) => [p, d, i, s, e]),
+      [[8000, 3, 'new', 8003, 8005], [8008, 0, '', 1, 2]]);
+    assert.equal(edits.unknown[0].d, 8008); assert.equal(edits.unknown[0].i.length, 8008);
+    await v2.reload();
+    assert.equal(await v2.evaluate(async () => (await PrefixType.getSensorSamplesForSession('old-a')).length), 260);
+    console.log('PASS schema v2 sensor rows compact to bounded lossless blocks and survive reload');
+
     const midnight = await page.evaluate(async () => {
       const start = Date.UTC(2026, 0, 2), end = start + 86400000;
       const db = await new Promise(resolve => {
-        const r = indexedDB.open('prefixtype-blackbox', 2); r.onsuccess = () => resolve(r.result);
+        const r = indexedDB.open('prefixtype-blackbox', 3); r.onsuccess = () => resolve(r.result);
       });
-      const tx = db.transaction(['sessions', 'sensors'], 'readwrite');
+      const tx = db.transaction(['sessions', 'sensors', 'events'], 'readwrite');
       tx.objectStore('sessions').put({ id: 'midnight-sensors', previousSessionId: null, initialText: '',
         a: start - 1000, z: end + 1000, c: end + 1000, r: 'restarted', x: 'abc', q: 'UTC', o: 0 });
-      for (const t of [start - 1, start, end - 1, end]) tx.objectStore('sensors').add({
+      const samples = [start - 1, start, end - 1, end].map(t => ({
         sid: 'midnight-sensors', type: 'orientation', t, timeStamp: 1, screenAngle: 0,
         alpha: 1, beta: null, gamma: 0, absolute: false, webkitCompassHeading: null, webkitCompassAccuracy: null
-      });
+      }));
+      // A legacy row and a compressed block spanning midnight coexist.
+      tx.objectStore('sensors').add(samples[0]);
+      tx.objectStore('sensors').add({ sid: 'midnight-sensors', t: start, data: Ptbox.encodeSamples(samples.slice(1)) });
+      tx.objectStore('events').add({ sid: 'midnight-sensors', t: start - 1, p: 0, d: 0, i: 'context old tail', s: 16, e: 16 });
+      tx.objectStore('events').add({ sid: 'midnight-sensors', t: start, p: 0, d: 16, i: 'context new tail', s: 11, e: 15 });
       await new Promise(resolve => tx.oncomplete = resolve); db.close();
       return { start, end, records: await Promise.all(['2026-01-01', '2026-01-02', '2026-01-03'].map(PrefixType.buildDailyRecord)) };
     });
     assert.deepEqual(midnight.records.map(r => r.fragments.find(f => f.session.id === 'midnight-sensors').samples.map(s => s.t)),
       [[midnight.start - 1], [midnight.start, midnight.end - 1], [midnight.end]]);
+    const secondDay = midnight.records[1].fragments.find(f => f.session.id === 'midnight-sensors');
+    assert.equal(secondDay.initialValue, 'context old tail');
+    assert.deepEqual(secondDay.events.map(({ p, d, i, s, e }) => [p, d, i, s, e]), [[8, 3, 'new', 11, 15]]);
     for (const record of midnight.records) assert.deepEqual(pt.audit(pt.decode(pt.encode(record))).errors, []);
     console.log('PASS sensor exports use half-open midnight boundaries without duplicate samples');
     assert.deepEqual(errors, []);

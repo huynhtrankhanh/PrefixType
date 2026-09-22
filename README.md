@@ -105,17 +105,19 @@ Separately, the canvas editor replayed all **187,436 events** across **203 sessi
 
 ## Database and trace format
 
-The existing IndexedDB database remains `prefixtype-blackbox`, schema version **2**, which adds a `sensors` store without rewriting existing sessions or text events. Existing records remain readable.
+The existing IndexedDB database remains `prefixtype-blackbox`, schema version **3**. Existing sensor rows are compacted atomically into blocks of at most 128 samples during upgrade; session metadata is unchanged. Existing text replacements are compacted when the session has an explicit initial text; legacy records with unknown initial state retain their original deltas. If the upgrade fails, IndexedDB rolls it back. Existing records remain readable.
 
 | Store | Fields |
 | --- | --- |
 | `sessions`, key `id` | `a`: start; `z`: end or null; `c`: checkpoint; `r`: end reason; `x`: practice text; `q`: time zone; `o`: UTC offset minutes; optional `owner`: live-tab identity; `previousSessionId`: pagehide predecessor or null; `initialText`: session starting text |
 | `events`, auto-increment key `k` | `sid`: session ID; `t`: timestamp; `p`: replacement offset; `d`: deleted code units; `i`: inserted string; `s`, `e`: resulting selection start/end |
-| `sensors`, auto-increment key `k` | `sid`: session ID; `t`: receipt time clamped to the session checkpoint; `type`: motion/orientation/orientationabsolute; `timeStamp`: browser event timestamp; `screenAngle`; sensor fields described below |
+| `sensors`, auto-increment key `k` | `sid`: session ID; `t`: first sample receipt time; `data`: Uint8Array containing a version-5 compressed sample block. Legacy individual sample rows remain readable. |
 
-Session metadata, text deltas, and sensor samples are written in the same transaction. Writes are batched for up to 100 ms; reads/exports flush through their invocation boundary, and pagehide flushes the pending batch immediately. Daily exports read all three stores in one consistent transaction. A continuous sensor stream does not prevent an export from completing. Checkpoints occur every five seconds. Interrupted sessions recover to their last checkpoint. Where Web Locks are available, recovery skips sessions owned by a live tab; the tab releases its lock on pagehide and reacquires it on restoration. Storage failures are reported and prevent a misleading successful export.
+Session metadata, text deltas, and sensor samples are written in the same transaction. Writes are batched for up to 100 ms; sensor samples in each batch share one compressed row per session (up to 128 samples per block), avoiding repeated object fields and index entries. Reads/exports flush through their invocation boundary, and pagehide flushes the pending batch immediately. Daily exports read all three stores in one consistent transaction. A continuous sensor stream does not prevent an export from completing. Checkpoints occur every five seconds. Interrupted sessions recover to their last checkpoint. Where Web Locks are available, recovery skips sessions owned by a live tab; the tab releases its lock on pagehide and reacquires it on restoration. Storage failures are reported and prevent a misleading successful export.
 
 Daily records use browser-local midnight boundaries, including 23- or 25-hour DST days. Today's export ends at its snapshot time. A fragment includes edits in that day window and its state reconstructed from `initialText` plus earlier edits. Day windows are half-open: an edit exactly at midnight belongs only to the next day's file, retaining the same session ID. Session reasons remain `completed`, `restarted`, `practice-text-changed`, `pagehide`, and `recovered`.
+
+Text recordings trim the unchanged prefix and suffix inside each replacement. For example, a whole-draft `context old tail` → `context new tail` update stores only `p=8, d=3, i="new"`. This applies to new IndexedDB writes, schema upgrades with known initial text, and daily exports. Every update retains its timestamp and resulting selection, including no-op updates. UTF-16 units, lone surrogates, and replayed text remain exact. The normalized range does not preserve the original IME replacement range, and an update is not necessarily a keystroke. Editor/IME behavior and live insertion statistics are unchanged.
 
 ### PTBOX encoding
 
@@ -126,9 +128,10 @@ Session, export, edit, and sample `t` timestamps are little-endian Float64 Unix 
 - **Version 1:** strings use UTF-8, preserving compatibility with the supplied files and existing readers.
 - **Version 2:** strings use UTF-16LE, preserving unpaired surrogates that UTF-8/TextEncoder would replace with U+FFFD. Other fields match v1.
 - **Version 3:** UTF-16LE with explicit session linkage after each session ID. Fragment initial text makes new continuation sessions independently replayable.
-- **Version 4:** current app exports retain v3 text/linkage encoding and append a sensor sample stream to every fragment. Old readers must add v4 support to read new exports.
+- **Version 4:** retains v3 text/linkage encoding and appends a sensor sample stream to every fragment.
+- **Version 5:** current app exports losslessly compress the sensor stream using per-field XOR deltas. Text and linkage encoding are unchanged. Readers need v5 support for new exports.
 
-The decoder accepts versions 1–4. Automatic encoding upgrades to v4 when samples are present and preserves decoded v4 files even when their sample streams are empty. Explicit export to versions 1–3 rejects sensor data rather than dropping it; explicit export to versions 1–2 also rejects linkage. Old sessions retain an explicit "linkage unknown" tag, so no predecessor is fabricated.
+The decoder accepts versions 1–5. Automatic encoding upgrades to v5 when samples are present. Pass an explicit version to `Ptbox.encode(record, 4)` to export the old uncompressed format or reproduce a decoded v4 file. Empty streams retain their record version. Explicit export to versions 1–3 rejects sensor data rather than dropping it; explicit export to versions 1–2 also rejects linkage. Old sessions retain an explicit "linkage unknown" tag, so no predecessor is fabricated.
 
 Header field order:
 
@@ -138,13 +141,19 @@ Header field order:
 
 For each fragment:
 
-1. Session ID; **v3/v4:** one linkage byte (`0`: legacy/unknown, `1`: independent session, `2`: continuation). For tag `2`, a nonempty predecessor-ID string follows. Then original start and original end (`NaN` while open).
+1. Session ID; **v3–v5:** one linkage byte (`0`: legacy/unknown, `1`: independent session, `2`: continuation). For tag `2`, a nonempty predecessor-ID string follows. Then original start and original end (`NaN` while open).
 2. Clipped fragment start/end; end reason; session time zone; offset minutes.
 3. Practice text; initial fragment text; delta count.
 4. For each delta: timestamp, replacement offset, deletion count, inserted string, selection start, selection end.
-5. **v4 only:** sensor sample count (varint), then the samples in delivery order. Each begins with a type byte (`1`: motion, `2`: orientation, `3`: absolute-orientation event), then Float64 `t`, `timeStamp`, and `screenAngle`.
+5. **v4/v5:** sensor sample count (varint), then the samples in delivery order. Each begins with a type byte (`1`: motion, `2`: orientation, `3`: absolute-orientation event), then Float64 `t`, `timeStamp`, and `screenAngle` in v4. V5 replaces the Float64 fields in steps 5–7 with the compressed encoding below.
 6. Motion samples continue with ten Float64 values: `accelerationX/Y/Z`, `gravityX/Y/Z` (acceleration including gravity), `rotationAlpha/Beta/Gamma`, and `interval`.
 7. Orientation samples continue with five Float64 values: `alpha`, `beta`, `gamma`, `webkitCompassHeading`, `webkitCompassAccuracy`, then one absolute-reference byte (`0`: unavailable, `1`: false, `2`: true). The event type and its absolute flag are preserved separately.
+
+V5 keeps separate predictor state for each event type, reset at every fragment or IndexedDB block. The field order is `t`, `timeStamp`, `screenAngle`, followed by the type's sensor fields above. Each prior Float64 starts as canonical quiet NaN (`0x7ff8000000000000`). After the event-type byte, a varint bitmask identifies changed fields. Each changed field has a one-byte mask identifying nonzero XOR bytes, followed by those bytes in little-endian byte order. Unchanged fields consume no further bytes. Orientation's absolute-reference byte still follows the numeric payload. This uses exact floating-point bits, preserving signed zeros, null transitions, and every delivered sample without rounding, resampling, or arithmetic-delta errors.
+
+Stored blocks use a version byte (`5`), sample-count varint, and the same v5 sample stream. `Ptbox.encodeSamples` and `Ptbox.decodeSamples` encode/decode these blocks. Blocks are independent, so reads and exports do not need earlier batches. The existing `sid` index selects a session's blocks; the `t` index describes block starts, not individual samples. Exports decode before applying day boundaries.
+
+Run `node scripts/benchmark-sensors.cjs` for reproducible synthetic 60 Hz motion and orientation comparisons. For one minute (7,200 samples), v4 uses 615,774 bytes; v5 uses 88,104 stationary, 412,484 smoothly varying, and 412,980 noisy bytes (33–86% smaller). Serialized IndexedDB value payloads shrink 75–90% with 100 ms batches; these are Node serialization measurements, not browser disk-usage guarantees. Actual savings depend on sensor values and batching. The same benchmark tests 1,000 whole-draft text updates with one changing word: trimming reduces the synthetic file from 16,035,149 to 34,382 bytes (99.8%) while preserving every rendered state and selection.
 
 For sensor fields, Float64 NaN represents unavailable data and decodes to `null`; finite values, including zero and signed zero, are preserved without quantization. Sample `t` must be finite. Unknown sample types, invalid flags, infinite values, and negative motion intervals are rejected. Samples do not participate in text replay. The auditor checks their ordering and fragment/day bounds. Daily fragments include only their own sensor samples; no previous sensor value is carried forward or fabricated at midnight.
 
@@ -154,7 +163,7 @@ Apply a delta to a JavaScript string as:
 value = value.slice(0, event.p) + event.i + value.slice(event.p + event.d);
 ```
 
-New v3/v4 session fragments replay directly from `fragment.initialValue`; use `session.previousSessionId` for linkage, even when the predecessor is in a different file. `Ptbox.initialState(fragment, previous)` retains inference for legacy records only; explicit linkage never depends on file ordering. The validator checks signatures, versions, truncation, varint overflow, UTF encoding, trailing bytes, edit/selection ranges, event ordering, fragment intervals, accumulated durations, completed text, invalid/cyclic predecessor links, and predecessor/initial-text agreement when both complete fragments are available. A v4 trace includes text changes and any available device sensor samples; it does not contain raw key, pointer, or OS candidate-window events.
+New v3–v5 session fragments replay directly from `fragment.initialValue`; use `session.previousSessionId` for linkage, even when the predecessor is in a different file. `Ptbox.initialState(fragment, previous)` retains inference for legacy records only; explicit linkage never depends on file ordering. The validator checks signatures, versions, truncation, varint overflow, UTF encoding, trailing bytes, edit/selection ranges, event ordering, fragment intervals, accumulated durations, completed text, invalid/cyclic predecessor links, and predecessor/initial-text agreement when both complete fragments are available. A v4/v5 trace includes text changes and any available device sensor samples; it does not contain raw key, pointer, or OS candidate-window events.
 
 ### Device motion and orientation recording
 
@@ -221,4 +230,4 @@ The implementation follows the [EditContext specification](https://www.w3.org/TR
 
 PrefixType uses the license in [LICENSE](LICENSE). The vendored bidirectional-text implementation is covered by [its MIT license](vendor/bidi-LICENSE.txt).
 
-Sensor verification includes v4 codec round-trips and malformed/truncated inputs, Chromium virtual motion/orientation sensors, permission grant/denial simulations, database migration, persistence/reload, completion, hidden pages, pagehide continuation, and half-open midnight exports. `test-results/sensor-strip.png` shows the indicator during simulated sensor delivery.
+Sensor verification includes v4/v5 codec round-trips and malformed/truncated inputs, Chromium virtual motion/orientation sensors, permission grant/denial simulations, database migration, persistence/reload, completion, hidden pages, pagehide continuation, and half-open midnight exports. `test-results/sensor-strip.png` shows the indicator during simulated sensor delivery.

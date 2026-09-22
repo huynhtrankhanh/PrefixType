@@ -18,7 +18,7 @@
       const progressBar = document.getElementById("progressBar");
 
       const DB_NAME = "prefixtype-blackbox";
-      const DB_VERSION = 2;
+      const DB_VERSION = 3;
       const SESSION_STORE = "sessions";
       const EVENT_STORE = "events";
       const SENSOR_STORE = "sensors";
@@ -94,7 +94,51 @@
               const samples = db.createObjectStore(SENSOR_STORE, { keyPath: 'k', autoIncrement: true });
               samples.createIndex('sid', 'sid', { unique: false });
               samples.createIndex('t', 't', { unique: false });
+            } else {
+              // Replace legacy rows in bounded blocks within the atomic upgrade.
+              // Retain the first key so delivery order survives interleaved sessions.
+              const store = request.transaction.objectStore(SENSOR_STORE);
+              let block = [];
+              const save = () => {
+                if (block.length) store.put({ ...sensorBlock(block), k: block[0].k });
+                block = [];
+              };
+              const cursorRequest = store.openCursor();
+              cursorRequest.onsuccess = () => {
+                try {
+                  const cursor = cursorRequest.result;
+                  if (!cursor) { save(); return; }
+                  const row = cursor.value;
+                  if (row.data || (block.length && (block[0].sid !== row.sid || block.length >= 128))) save();
+                  if (!row.data) { block.push(row); cursor.delete(); }
+                  cursor.continue();
+                } catch (error) { request.transaction.abort(); }
+              };
             }
+            // Compact existing replacements only when their initial text is known.
+            // Legacy continuation records without it must retain their raw deltas.
+            const upgrade = request.transaction;
+            const sessionsRequest = upgrade.objectStore(SESSION_STORE).getAll();
+            sessionsRequest.onsuccess = () => {
+              const sessions = new Map(sessionsRequest.result.map(session => [session.id, session]));
+              let sid, value;
+              const edits = upgrade.objectStore(EVENT_STORE).index('sid').openCursor();
+              edits.onsuccess = () => {
+                try {
+                  const cursor = edits.result;
+                  if (!cursor) return;
+                  const event = cursor.value;
+                  if (sid !== event.sid) { sid = event.sid; value = sessions.get(sid)?.initialText; }
+                  if (typeof value === 'string') {
+                    const next = Ptbox.apply(value, event);
+                    const compact = Ptbox.compactEdit(event, value.slice(event.p, event.p + event.d));
+                    if (compact.p !== event.p || compact.d !== event.d || compact.i !== event.i) cursor.update(compact);
+                    value = next;
+                  }
+                  cursor.continue();
+                } catch (error) { upgrade.abort(); }
+              };
+            };
           };
           request.onblocked = () => { status.textContent = 'Close other PrefixType tabs to update storage'; };
           request.onsuccess = () => {
@@ -150,6 +194,15 @@
         if (writeTimer === null) writeTimer = window.setTimeout(flushPending, 100);
         return writeChain;
       }
+      function sensorBlock(samples) {
+        return { sid: samples[0].sid, t: samples[0].t, data: Ptbox.encodeSamples(samples) };
+      }
+      function* unpackSensors(rows) {
+        for (const row of rows) {
+          if (!row.data) { yield row; continue; }
+          for (const sample of Ptbox.decodeSamples(row.data)) yield { ...sample, sid: row.sid, k: row.k };
+        }
+      }
       function flushPending() {
         if (writeTimer !== null) window.clearTimeout(writeTimer);
         writeTimer = null;
@@ -159,13 +212,21 @@
           const db = await dbPromise;
           await ownerReady;
           if (!db) throw new Error('Storage unavailable');
-          const tx = db.transaction([SESSION_STORE, EVENT_STORE, SENSOR_STORE], 'readwrite');
-          const done = transactionDone(tx);
-          const sessions = new Map();
+          const sessions = new Map(), blocks = [], events = [];
+          let samples = [];
+          const save = () => { if (samples.length) blocks.push(sensorBlock(samples)); samples = []; };
           for (const item of batch) {
             sessions.set(item.session.id, item.session);
-            if (item.event) tx.objectStore(item.sensor ? SENSOR_STORE : EVENT_STORE).add(item.event);
+            if (!item.event) continue;
+            if (!item.sensor) { events.push(item.event); continue; }
+            if (samples.length && (samples[0].sid !== item.event.sid || samples.length >= 128)) save();
+            samples.push(item.event);
           }
+          save();
+          const tx = db.transaction([SESSION_STORE, EVENT_STORE, SENSOR_STORE], 'readwrite');
+          const done = transactionDone(tx);
+          for (const event of events) tx.objectStore(EVENT_STORE).add(event);
+          for (const block of blocks) tx.objectStore(SENSOR_STORE).add(block);
           for (const session of sessions.values()) tx.objectStore(SESSION_STORE).put(session);
           await done;
         }).catch(error => {
@@ -214,7 +275,7 @@
         const done = transactionDone(tx);
         const samples = await requestResult(tx.objectStore(SENSOR_STORE).index('sid').getAll(IDBKeyRange.only(sessionId)));
         await done;
-        return samples.sort((a, b) => a.k - b.k);
+        return [...unpackSensors(samples.sort((a, b) => a.k - b.k))];
       }
 
       function makeSessionId(now) {
@@ -270,11 +331,11 @@
       function recordEdit(delta, at) {
         beginRecordingSession(at);
         activeSession.c = Math.max(activeSession.c, at);
-        putDelta(activeSession, {
+        putDelta(activeSession, Ptbox.compactEdit({
           sid: activeSession.id, t: activeSession.c,
           p: delta.p, d: delta.d, i: delta.i,
           s: typingInput.selectionStart, e: typingInput.selectionEnd
-        });
+        }, delta.removed));
       }
 
       function applyDelta(value, event) {
@@ -501,7 +562,7 @@
           eventsBySession.get(event.sid).push(event);
         }
         const samplesBySession = new Map();
-        for (const sample of allSamples) {
+        for (const sample of unpackSensors(allSamples)) {
           if (!samplesBySession.has(sample.sid)) samplesBySession.set(sample.sid, []);
           samplesBySession.get(sample.sid).push(sample);
         }
@@ -521,13 +582,16 @@
           const events = eventsBySession.get(session.id) || [];
           events.sort((a, b) => a.k - b.k);
           let initialValue = session.initialText ?? "";
+          let value = initialValue;
           const fragmentEvents = [];
           for (const event of events) {
             if (event.t < fragmentStart) {
               initialValue = applyDelta(initialValue, event);
             } else if (event.t >= bounds.start && event.t < recordEnd && event.t <= fragmentEnd) {
-              fragmentEvents.push(event);
+              fragmentEvents.push(typeof session.initialText === 'string' ?
+                Ptbox.compactEdit(event, value.slice(event.p, event.p + event.d)) : event);
             }
+            value = applyDelta(value, event);
           }
 
           const samples = (samplesBySession.get(session.id) || []).filter(sample =>
@@ -547,7 +611,7 @@
         }
 
         return {
-          version: 4,
+          version: 5,
           dayKey,
           timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
           dayStart: bounds.start,

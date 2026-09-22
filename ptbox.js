@@ -3,6 +3,8 @@
  * session linkage immediately after each session ID: u8 0=legacy unknown,
  * 1=independent session, 2=continued session followed by predecessor ID string.
  * v4 appends timestamped device sensor samples after each fragment's edits.
+ * v5 losslessly XOR-compresses Float64 sensor fields against the previous
+ * sample of the same type, omitting unchanged fields and zero XOR bytes.
  * Offsets/deletion counts are UTF-16 code units in all versions. */
 (function (root) {
   'use strict';
@@ -17,10 +19,15 @@
     return true;
   }
   class Writer {
-    constructor(version) { this.version = version; this.parts = []; }
-    bytes(value) { this.parts.push(Uint8Array.from(value)); }
-    u8(value) { this.bytes([value]); }
-    f64(value) { const b = new Uint8Array(8); new DataView(b.buffer).setFloat64(0, value, true); this.parts.push(b); }
+    constructor(version) { this.version = version; this.buffer = new Uint8Array(1024); this.at = 0; }
+    reserve(count) {
+      if (this.at + count <= this.buffer.length) return;
+      const next = new Uint8Array(Math.max(this.buffer.length * 2, this.at + count));
+      next.set(this.buffer); this.buffer = next;
+    }
+    bytes(value) { this.reserve(value.length); this.buffer.set(value, this.at); this.at += value.length; }
+    u8(value) { this.reserve(1); this.buffer[this.at++] = value; }
+    f64(value) { this.reserve(8); new DataView(this.buffer.buffer).setFloat64(this.at, value, true); this.at += 8; }
     uint(value) {
       if (!Number.isSafeInteger(value) || value < 0) throw new RangeError('Invalid unsigned integer');
       const bytes = [];
@@ -34,11 +41,10 @@
         bytes = new Uint8Array(value.length * 2);
         for (let i = 0; i < value.length; i++) { const unit = value.charCodeAt(i); bytes[i * 2] = unit & 255; bytes[i * 2 + 1] = unit >>> 8; }
       }
-      this.uint(bytes.length); this.parts.push(bytes);
+      this.uint(bytes.length); this.bytes(bytes);
     }
     finish() {
-      const out = new Uint8Array(this.parts.reduce((sum, b) => sum + b.length, 0));
-      let at = 0; for (const part of this.parts) { out.set(part, at); at += part.length; } return out;
+      return this.buffer.slice(0, this.at);
     }
   }
   class Reader {
@@ -97,6 +103,52 @@
   };
   sensorFields.orientationabsolute = sensorFields.orientation;
   const sampleFields = sample => ['timeStamp', 'screenAngle', ...(sensorFields[sample.type] || [])];
+  function sensorState(states, type) {
+    if (!states[type]) {
+      const fields = ['t', ...sampleFields({ type })];
+      const bytes = new Uint8Array(fields.length * 8);
+      const view = new DataView(bytes.buffer);
+      for (let i = 0; i < fields.length; i++) view.setUint32(i * 8 + 4, 0x7ff80000, true);
+      states[type] = { fields, bytes, view };
+    }
+    return states[type];
+  }
+  function writeSensor(w, sample, states) {
+    const state = sensorState(states, sample.type);
+    const next = new Uint8Array(state.bytes.length), view = new DataView(next.buffer);
+    let changed = 0;
+    const masks = [];
+    for (let i = 0; i < state.fields.length; i++) {
+      const value = sample[state.fields[i]];
+      if (value === null) view.setUint32(i * 8 + 4, 0x7ff80000, true);
+      else view.setFloat64(i * 8, value, true);
+      let mask = 0;
+      for (let b = 0; b < 8; b++) if (next[i * 8 + b] !== state.bytes[i * 8 + b]) mask |= 1 << b;
+      masks.push(mask);
+      if (mask) changed |= 1 << i;
+    }
+    w.uint(changed);
+    for (let i = 0; i < masks.length; i++) if (masks[i]) {
+      w.u8(masks[i]);
+      for (let b = 0; b < 8; b++) if (masks[i] & (1 << b)) w.u8(next[i * 8 + b] ^ state.bytes[i * 8 + b]);
+    }
+    state.bytes.set(next);
+  }
+  function readSensor(r, type, states) {
+    const state = sensorState(states, type), changed = r.uint();
+    if (changed >= 2 ** state.fields.length) throw new Error('Invalid sensor field mask');
+    const sample = { type };
+    for (let i = 0; i < state.fields.length; i++) {
+      if (changed & (1 << i)) {
+        const mask = r.u8();
+        if (!mask) throw new Error('Empty sensor byte mask');
+        for (let b = 0; b < 8; b++) if (mask & (1 << b)) state.bytes[i * 8 + b] ^= r.u8();
+      }
+      const value = state.view.getFloat64(i * 8, true);
+      sample[state.fields[i]] = state.fields[i] !== 't' && Number.isNaN(value) ? null : value;
+    }
+    return sample;
+  }
   function validateSample(sample) {
     if (!sensorTypes.includes(sample.type)) throw new Error('Invalid sensor type');
     if (!Number.isFinite(sample.t)) throw new Error('Invalid sensor time');
@@ -106,10 +158,56 @@
     if (sample.type !== 'motion' && sample.absolute !== null && typeof sample.absolute !== 'boolean') throw new Error('Invalid absolute flag');
     if (sample.type === 'motion' && sample.interval !== null && sample.interval < 0) throw new Error('Invalid sensor interval');
   }
-  function encode(record, version = record.fragments.some(f => f.samples?.length) ? 4 :
+  function writeSamples(w, samples) {
+    w.uint(samples.length);
+    const states = {};
+    for (const sample of samples) {
+      validateSample(sample);
+      w.u8(sensorTypes.indexOf(sample.type) + 1);
+      if (w.version >= 5) writeSensor(w, sample, states);
+      else {
+        w.f64(sample.t);
+        for (const field of sampleFields(sample)) w.f64(sample[field] === null ? NaN : sample[field]);
+      }
+      if (sample.type !== 'motion') w.u8(sample.absolute === null ? 0 : sample.absolute ? 2 : 1);
+    }
+  }
+  function readSamples(r) {
+    const samples = [];
+    const count = r.count();
+    const states = {};
+    for (let j = 0; j < count; j++) {
+      const type = sensorTypes[r.u8() - 1];
+      if (!type) throw new Error('Invalid sensor type');
+      const sample = r.version >= 5 ? readSensor(r, type, states) : { type, t: r.f64() };
+      for (const field of r.version >= 5 ? [] : sampleFields(sample)) {
+        const value = r.f64(); sample[field] = Number.isNaN(value) ? null : value;
+      }
+      if (type !== 'motion') {
+        const flag = r.u8();
+        if (flag > 2) throw new Error('Invalid absolute flag');
+        sample.absolute = flag === 0 ? null : flag === 2;
+      }
+      validateSample(sample); samples.push(sample);
+    }
+    return samples;
+  }
+  function encodeSamples(samples) {
+    const w = new Writer(5);
+    w.u8(5); writeSamples(w, samples);
+    return w.finish();
+  }
+  function decodeSamples(bytes) {
+    const r = new Reader(bytes); r.version = r.u8();
+    if (r.version !== 5) throw new Error("Unsupported sensor block version");
+    const samples = readSamples(r);
+    if (r.at !== r.bytes.length) throw new Error("Trailing sensor block bytes");
+    return samples;
+  }
+  function encode(record, version = record.fragments.some(f => f.samples?.length) ? 5 :
     Math.max(record.version ?? 1, record.fragments.some(f => hasLinkage(f.session)) ? 3 :
       (strings(record).every(wellFormed) ? 1 : 2))) {
-    if (![1, 2, 3, 4].includes(version)) throw new Error('Unsupported PTBOX version');
+    if (![1, 2, 3, 4, 5].includes(version)) throw new Error('Unsupported PTBOX version');
     if (version < 4 && record.fragments.some(f => f.samples?.length)) throw new Error('PTBOX v1/v2/v3 cannot preserve sensor samples');
     if (version < 3 && record.fragments.some(f => hasLinkage(f.session))) throw new Error('PTBOX v1/v2 cannot preserve session linkage');
     if (version === 1 && !strings(record).every(wellFormed)) throw new Error('PTBOX v1 cannot preserve lone surrogates');
@@ -131,22 +229,14 @@
       w.string(s.r || ''); w.string(s.q || ''); w.f64(Number.isFinite(s.o) ? s.o : NaN);
       w.string(s.x || ''); w.string(f.initialValue); w.uint(f.events.length);
       for (const e of f.events) { w.f64(e.t); w.uint(e.p); w.uint(e.d); w.string(e.i); w.uint(e.s); w.uint(e.e); }
-      if (version >= 4) {
-        w.uint(f.samples?.length || 0);
-        for (const sample of f.samples || []) {
-          validateSample(sample);
-          w.u8(sensorTypes.indexOf(sample.type) + 1); w.f64(sample.t);
-          for (const field of sampleFields(sample)) w.f64(sample[field] === null ? NaN : sample[field]);
-          if (sample.type !== 'motion') w.u8(sample.absolute === null ? 0 : sample.absolute ? 2 : 1);
-        }
-      }
+      if (version >= 4) writeSamples(w, f.samples || []);
     }
     return w.finish();
   }
   function decode(bytes) {
     const r = new Reader(bytes);
     if (String.fromCharCode(...r.take(5)) !== 'PTBOX') throw new Error('Invalid PTBOX signature');
-    r.version = r.u8(); if (![1, 2, 3, 4].includes(r.version)) throw new Error('Unsupported PTBOX version');
+    r.version = r.u8(); if (![1, 2, 3, 4, 5].includes(r.version)) throw new Error('Unsupported PTBOX version');
     const record = { version: r.version, exportedAt: r.f64(), dayKey: r.string(), timeZone: r.string(),
       dayStart: r.f64(), dayEnd: r.f64(), accumulatedMs: r.f64(), fragments: [] };
     const count = r.count();
@@ -167,24 +257,7 @@
       f.initialValue = r.string(); f.events = [];
       const n = r.count();
       for (let j = 0; j < n; j++) f.events.push({ t: r.f64(), p: r.uint(), d: r.uint(), i: r.string(), s: r.uint(), e: r.uint() });
-      if (r.version >= 4) {
-        f.samples = [];
-        const count = r.count();
-        for (let j = 0; j < count; j++) {
-          const type = sensorTypes[r.u8() - 1];
-          if (!type) throw new Error('Invalid sensor type');
-          const sample = { type, t: r.f64() };
-          for (const field of sampleFields(sample)) {
-            const value = r.f64(); sample[field] = Number.isNaN(value) ? null : value;
-          }
-          if (type !== 'motion') {
-            const flag = r.u8();
-            if (flag > 2) throw new Error('Invalid absolute flag');
-            sample.absolute = flag === 0 ? null : flag === 2;
-          }
-          validateSample(sample); f.samples.push(sample);
-        }
-      }
+      if (r.version >= 4) f.samples = readSamples(r);
       record.fragments.push(f);
     }
     if (r.at !== r.bytes.length) throw new Error('Trailing PTBOX bytes');
@@ -199,6 +272,17 @@
       throw new Error('Selection outside text');
     }
     return next;
+  }
+  // Trim unchanged UTF-16 units inside a replacement, preserving the resulting
+  // text and selection even when the IME resends its entire composition draft.
+  function compactEdit(event, removed) {
+    if (typeof removed !== 'string' || removed.length !== event.d) throw new Error('Invalid removed text');
+    let prefix = 0, suffix = 0;
+    while (prefix < removed.length && prefix < event.i.length && removed[prefix] === event.i[prefix]) prefix++;
+    while (suffix < removed.length - prefix && suffix < event.i.length - prefix &&
+      removed[removed.length - 1 - suffix] === event.i[event.i.length - 1 - suffix]) suffix++;
+    return { ...event, p: event.p + prefix, d: event.d - prefix - suffix,
+      i: event.i.slice(prefix, event.i.length - suffix) };
   }
   // New sessions carry a self-contained initial state and explicit linkage.
   // Retain inference only for legacy records without linkage metadata.
@@ -278,7 +362,7 @@
     if (Math.abs(accumulated - record.accumulatedMs) > .01) errors.push('Accumulated duration mismatch');
     return { errors, warnings, fragments: record.fragments.length, events: eventCount, continuations };
   }
-  const api = { encode, decode, apply, audit, wellFormed, initialState };
+  const api = { encode, decode, encodeSamples, decodeSamples, compactEdit, apply, audit, wellFormed, initialState };
   root.Ptbox = api;
   if (typeof module !== 'undefined') module.exports = api;
 })(typeof window === 'undefined' ? globalThis : window);

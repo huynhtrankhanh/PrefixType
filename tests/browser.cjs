@@ -156,6 +156,24 @@ const ptbox = require('../ptbox.js');
       });
       assert.equal(lossless.events.at(-1).i, '\ud800');
     });
+    await run('whole-draft updates store compact changes while preserving each update and selection', async () => {
+      await reset('unfinished target');
+      const result = await page.evaluate(async () => {
+        const editor = PrefixType.editor, before = 'context '.repeat(1000) + 'old tail';
+        const after = 'context '.repeat(1000) + 'new tail';
+        editor.replace(0, 0, before);
+        editor.replace(0, before.length, after, [8003, 8005], { fromContext: true });
+        editor.replace(0, after.length, after, [1, 2], { fromContext: true });
+        await PrefixType.flush();
+        const session = (await PrefixType.getAllSessions()).at(-1);
+        return { after, events: await PrefixType.getEventsForSession(session.id) };
+      });
+      assert.equal(result.events.length, 3);
+      const edit = result.events[1];
+      assert.deepEqual([edit.p, edit.d, edit.i, edit.s, edit.e], [8000, 3, 'new', 8003, 8005]);
+      assert.deepEqual([result.events[2].d, result.events[2].i, result.events[2].s, result.events[2].e], [0, '', 1, 2]);
+      assert.equal(result.events.reduce(ptbox.apply, ''), result.after);
+    });
     await run('pagehide continuation and concurrent-tab recovery preserve session semantics', async () => {
       await reset('abcdef'); await page.keyboard.type('abc');
       await page.evaluate(async () => { await PrefixType.flush(); window.dispatchEvent(new PageTransitionEvent('pagehide')); await PrefixType.flush(); });
@@ -171,7 +189,7 @@ const ptbox = require('../ptbox.js');
         return Array.from(PrefixType.encodePtbox(await PrefixType.buildDailyRecord(day)));
       });
       const record = ptbox.decode(Uint8Array.from(exported));
-      assert.equal(record.version, 4);
+      assert.equal(record.version, 5);
       const continued = record.fragments.find(f => f.session.id === sessions.at(-1).id);
       assert.equal(continued.session.previousSessionId, sessions.at(-2).id);
       assert.equal(continued.initialValue, 'abc');
@@ -242,7 +260,7 @@ const ptbox = require('../ptbox.js');
       const tab = await zone.newPage(); await tab.goto(server.url);
       const result = await tab.evaluate(async () => {
         const dayStart = new Date(2026, 2, 8).getTime(), dayEnd = new Date(2026, 2, 9).getTime();
-        const db = await new Promise((resolve, reject) => { const r = indexedDB.open('prefixtype-blackbox', 2); r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
+        const db = await new Promise((resolve, reject) => { const r = indexedDB.open('prefixtype-blackbox', 3); r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
         const tx = db.transaction(['sessions', 'events'], 'readwrite');
         tx.objectStore('sessions').put({ id: 'dst-session', previousSessionId: null, initialText: '', a: dayStart - 1000, c: dayEnd + 1000, z: dayEnd + 1000, r: 'completed', x: 'abc', q: 'America/New_York', o: 300 });
         for (const [t, p, i] of [[dayStart - 500, 0, 'a'], [dayStart + 1000, 1, 'b'], [dayEnd, 2, 'c']]) tx.objectStore('events').add({ sid: 'dst-session', t, p, d: 0, i, s: p + 1, e: p + 1 });
