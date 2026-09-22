@@ -83,11 +83,8 @@
     }
 
     .sensor-strip {
-      position: absolute;
-      bottom: 0;
-      left: 0;
+      flex: 0 0 auto;
       width: 100%;
-      z-index: 4;
       min-height: 22px;
       padding: 2px 8px;
       border: 0;
@@ -547,8 +544,8 @@
           <button type="button" data-action="all">Select all</button>
         </div>
         <div id="finished" class="finished">Finished 🎉</div>
-        <button id="sensorIndicator" class="sensor-strip" type="button" aria-live="polite" hidden></button>
       </div>
+      <button id="sensorIndicator" class="sensor-strip" type="button" aria-live="polite" hidden></button>
     </section>
   </main>
 
