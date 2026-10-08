@@ -85,6 +85,7 @@
       this.model = new TextModel(); this.ctx = canvas.getContext('2d');
       this.lines = []; this.widths = new Map(); this.scroll = 0; this.frame = 0;
       this.undoStack = []; this.redoStack = []; this.formats = []; this.composing = false; this.revision = 0;
+      this.compositionRange = this.focusCompositionRange = null; this.contextNeedsSync = false;
       this.commandDepth = 0; this.pendingCompositionCommit = false;
       this.nativeMode = !('EditContext' in root); this.touchMode = false; this.touchMenu = false;
       this.bidi = root.bidi_js();
@@ -92,10 +93,27 @@
         this.editContext = new EditContext();
         canvas.editContext = this.editContext;
         this.editContext.addEventListener('textupdate', event => {
+          const range = this.focusCompositionRange ||
+            ((!this.hasFocus || !document.hasFocus() || this.commandDepth) && this.compositionRange);
+          if (range && event.text === '' && event.updateRangeStart === range[0] &&
+              event.updateRangeEnd === range[1] && range[1] > range[0]) {
+            // Some IMEs cancel instead of committing when focus changes. Keep
+            // the displayed draft, including late cancellation after refocus.
+            // Synchronize after the browser clears its composition state;
+            // updateText inside this callback can recursively cancel it.
+            this.focusCompositionRange = null;
+            this.contextNeedsSync = true;
+            setTimeout(() => this.syncContext(), 0);
+            return;
+          }
+          this.focusCompositionRange = null;
+          if (this.composing) this.compositionRange = [event.updateRangeStart, event.updateRangeStart + event.text.length];
           this.replace(event.updateRangeStart, event.updateRangeEnd - event.updateRangeStart,
             event.text, [event.selectionStart, event.selectionEnd], { fromContext: true });
         });
         this.editContext.addEventListener('compositionstart', () => {
+          this.syncContext();
+          this.focusCompositionRange = this.compositionRange = null;
           this.composing = true; this.compositionGroup = Symbol('composition');
         });
         this.editContext.addEventListener('compositionend', () => {
@@ -125,10 +143,12 @@
       });
       for (const el of [canvas, nativeInput]) {
         el.addEventListener('focus', () => { this.dispatchEvent(new Event('focus')); this.invalidate(); });
-        el.addEventListener('blur', () => this.invalidate());
+        el.addEventListener('blur', () => { this.rememberFocusComposition(); this.invalidate(); });
       }
+      root.addEventListener('blur', () => this.rememberFocusComposition());
       canvas.addEventListener('keydown', event => this.keydown(event));
       canvas.addEventListener('beforeinput', event => {
+        if (event.inputType.startsWith('delete')) this.focusCompositionRange = null;
         if (event.inputType !== 'insertParagraph' && event.inputType !== 'insertLineBreak') return;
         // Software keyboards can send a newline intent without a named key.
         // An active composition must not swallow an explicit editing command.
@@ -195,8 +215,18 @@
     get prefix() { return this.model.prefix; }
     get hasFocus() { return document.activeElement === (this.nativeMode ? this.nativeInput : this.element); }
     focus(options = { preventScroll: true }) { (this.nativeMode ? this.nativeInput : this.element).focus(options); }
+    rememberFocusComposition() {
+      if (this.composing && this.compositionRange) this.focusCompositionRange = this.compositionRange.slice();
+    }
+    syncContext() {
+      if (!this.contextNeedsSync) return;
+      this.contextNeedsSync = false;
+      this.editContext.updateText(0, this.editContext.text.length, this.value);
+      this.editContext.updateSelection(this.model.start, this.model.end);
+    }
     compositionEnded() {
       if (!this.composing) return;
+      this.compositionRange = null;
       this.composing = false; this.compositionGroup = null; this.formats = []; this.invalidate();
       if (this.commandDepth) this.pendingCompositionCommit = true;
       else this.dispatchEvent(new Event('compositioncommit'));
@@ -208,8 +238,8 @@
           // Detaching EditContext only clears the renderer's composition. The
           // OS IME can retain its preedit and insert it again at the new caret.
           // A DOM focus change also tells Chromium to reset the platform IME.
-          // Blur commits the displayed draft; restore focus synchronously so
-          // the command and subsequent input still target this editor.
+          // Preserve the displayed draft if the IME cancels on blur; restore
+          // focus synchronously so subsequent input still targets this editor.
           if (document.activeElement === this.element) {
             this.element.blur();
             this.element.focus({ preventScroll: true });
@@ -220,6 +250,7 @@
           }
           this.compositionEnded();
         }
+        this.syncContext();
         return action();
       } finally {
         this.commandDepth--;
@@ -240,6 +271,7 @@
     }
     reset(target, value = '') {
       if (this.composing) return this.runCommand(() => this.reset(target, value));
+      this.focusCompositionRange = null; this.contextNeedsSync = false;
       this.revision++;
       this.model.reset(target, value); this.lines = []; this.scroll = 0;
       this.undoStack = []; this.redoStack = []; this.formats = [];
@@ -252,6 +284,8 @@
     }
     replace(p, d, i, selection, options = {}) {
       if (this.composing && !options.fromContext) return this.runCommand(() => this.replace(p, d, i, selection, options));
+      if (!options.fromContext) this.syncContext();
+      this.focusCompositionRange = null;
       const delta = this.model.replace(p, d, i, selection);
       this.revision++; this.touchMenu = false;
       if (!options.history && (d || i.length)) {
@@ -325,6 +359,8 @@
       }
     }
     keydown(event) {
+      // A new user command (including Escape) can intentionally cancel text.
+      if (event.key !== 'Process' && event.key !== 'Unidentified') this.focusCompositionRange = null;
       // IMEs often mark even named navigation keys as composing/keyCode 229.
       // Dispatch commands by key; leave unrecognized Process/typing events to
       // the IME instead of disabling every command while a draft is active.

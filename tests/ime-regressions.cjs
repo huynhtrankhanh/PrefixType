@@ -55,6 +55,107 @@ const serve = require('./server.cjs');
       return { text: e.value, anchor: e.model.anchor, focus: e.model.focus,
         composing: e.composing, context: e.editContext.text, focused: e.hasFocus };
     });
+    for (const host of ['element', 'window']) {
+      await check(`focus-loss cancellation preserves the displayed draft: ${host}`, async () => {
+        await page.evaluate(() => { const e = PrefixType.editor; e.insert('before  after'); e.select(7); });
+        await compose('tiếng');
+        await page.keyboard.press('Control+Shift+ArrowLeft');
+        const before = await state();
+        await page.evaluate(host => {
+          // Replay the focus notification before the platform cancels preedit.
+          // CDP then supplies a real empty update and compositionend lifecycle.
+          const e = PrefixType.editor;
+          (host === 'window' ? window : e.element).dispatchEvent(new FocusEvent('blur'));
+          (host === 'window' ? window : e.element).dispatchEvent(new FocusEvent('focus'));
+          e.element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Process', keyCode: 229, isComposing: true }));
+          window.focusLossEdits = 0;
+          window.focusLossListener = () => window.focusLossEdits++;
+          e.addEventListener('input', window.focusLossListener);
+        }, host);
+        await compose('');
+        await page.waitForFunction(() => PrefixType.editor.editContext.text === PrefixType.editor.value);
+        assert.deepEqual(await state(), { ...before, composing: false });
+        assert.equal(await page.evaluate(() => window.focusLossEdits), 0);
+        await page.evaluate(() => PrefixType.editor.removeEventListener('input', window.focusLossListener));
+        // A later composition is fresh input at the preserved selection.
+        await compose('語');
+        await cdp.send('Input.insertText', { text: '語' });
+        assert.equal(await value(), before.text.slice(0, Math.min(before.anchor, before.focus)) + '語' +
+          before.text.slice(Math.max(before.anchor, before.focus)));
+        await page.keyboard.press('Control+z'); assert.equal(await value(), before.text);
+        await page.keyboard.press('Control+z'); assert.equal(await value(), 'before  after');
+      });
+    }
+    await check('real blur/refocus retains draft, selection and undo grouping', async () => {
+      await page.evaluate(() => { const e = PrefixType.editor; e.insert('before  after'); e.select(7); });
+      await compose('日本');
+      const before = await state();
+      await page.evaluate(() => { document.getElementById('records').focus(); PrefixType.editor.focus(); });
+      assert.deepEqual(await state(), { ...before, composing: false });
+      await compose('語'); await cdp.send('Input.insertText', { text: '語' });
+      assert.equal(await value(), 'before 日本語 after');
+      await page.keyboard.press('Control+z'); assert.equal(await value(), before.text);
+      await page.keyboard.press('Control+z'); assert.equal(await value(), 'before  after');
+    });
+    const lateFocusCancellation = () => page.evaluate(() => {
+      // Model a delayed platform cancellation after DOM blur already ended
+      // composition. As with a real textupdate, mutate the shared buffer first.
+      const e = PrefixType.editor;
+      e.editContext.updateText(7, 9, ''); e.editContext.updateSelection(7, 7);
+      e.editContext.dispatchEvent(new TextUpdateEvent('textupdate', {
+        updateRangeStart: 7, updateRangeEnd: 9, text: '', selectionStart: 7, selectionEnd: 7
+      }));
+    });
+    await check('late cancellation after real refocus cannot erase a committed draft', async () => {
+      await page.evaluate(() => { const e = PrefixType.editor; e.insert('before  after'); e.select(7); });
+      await compose('日本');
+      const before = await state();
+      await page.evaluate(() => { const e = PrefixType.editor; e.element.blur(); e.focus(); });
+      await lateFocusCancellation();
+      await page.waitForFunction(() => PrefixType.editor.editContext.text === PrefixType.editor.value);
+      assert.deepEqual(await state(), { ...before, composing: false });
+      await page.keyboard.press('Control+z'); assert.equal(await value(), 'before  after');
+      await page.keyboard.press('Control+Shift+z'); assert.equal(await value(), before.text);
+    });
+    await check('Escape after refocus still cancels a live composition', async () => {
+      await compose('日本');
+      await page.evaluate(() => {
+        const el = PrefixType.editor.element;
+        el.dispatchEvent(new FocusEvent('blur')); el.dispatchEvent(new FocusEvent('focus'));
+      });
+      await page.keyboard.press('Escape');
+      await compose('');
+      assert.equal(await value(), ''); assert.equal((await state()).composing, false);
+    });
+    await check('software deletion after refocus still cancels a live composition', async () => {
+      await compose('日本');
+      await page.evaluate(() => {
+        const el = PrefixType.editor.element;
+        el.dispatchEvent(new FocusEvent('blur')); el.dispatchEvent(new FocusEvent('focus'));
+        el.dispatchEvent(new InputEvent('beforeinput', { inputType: 'deleteContentBackward', isComposing: true }));
+      });
+      await compose('');
+      assert.equal(await value(), ''); assert.equal((await state()).context, '');
+    });
+    await check('Enter preserves a draft canceled synchronously on command blur', async () => {
+      await page.evaluate(() => { const e = PrefixType.editor; e.insert('before  after'); e.select(7); });
+      await compose('日本');
+      await page.evaluate(() => PrefixType.editor.element.addEventListener('blur', () => {
+        const e = PrefixType.editor;
+        e.editContext.updateText(7, 9, ''); e.editContext.updateSelection(7, 7);
+        e.editContext.dispatchEvent(new TextUpdateEvent('textupdate', {
+          updateRangeStart: 7, updateRangeEnd: 9, text: '', selectionStart: 7, selectionEnd: 7
+        }));
+      }, { once: true }));
+      await page.keyboard.press('Enter');
+      assert.equal(await value(), 'before 日本\n after');
+      assert.equal((await state()).context, await value());
+      await compose('語'); await cdp.send('Input.insertText', { text: '語' });
+      assert.equal(await value(), 'before 日本\n語 after');
+      await page.keyboard.press('Control+z'); assert.equal(await value(), 'before 日本\n after');
+      await page.keyboard.press('Control+z'); assert.equal(await value(), 'before 日本 after');
+      await page.keyboard.press('Control+z'); assert.equal(await value(), 'before  after');
+    });
     await check('Enter resets platform focus and inserts once without clearing pixels', async () => {
       await compose('日本');
       await page.evaluate(() => {

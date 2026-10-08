@@ -94,6 +94,33 @@ const serve = require('./server.cjs');
       assert.deepEqual(await run(false), expected, key);
       console.log('PASS live IBus navigation, continued composition and commit match native textarea:', key);
     }
+    for (const destination of ['blur', 'control']) {
+      const run = async native => {
+        await reset(native); await type('nihao');
+        const before = await state();
+        await page.evaluate(destination => {
+          if (destination === 'blur') document.activeElement.blur();
+          else document.getElementById('records').focus();
+          PrefixType.editor.focus();
+        }, destination);
+        const returned = await state();
+        assert.deepEqual(returned, { ...before, composing: false });
+        assert.equal(await page.evaluate(() => window.imeBlurs), 1);
+        await type('ni'); await commit();
+        const next = await state();
+        assert(next.text.startsWith(before.text.slice(0, before.start)));
+        if (!native) {
+          await page.keyboard.press('Control+z'); assert.equal((await state()).text, before.text);
+          await page.keyboard.press('Control+z'); assert.equal((await state()).text, 'before  after');
+          await page.keyboard.press('Control+Shift+z');
+          await page.keyboard.press('Control+Shift+z'); assert.equal((await state()).text, next.text);
+        }
+        return { before, returned, next };
+      };
+      const expected = await run(true);
+      assert.deepEqual(await run(false), expected, destination);
+      console.log('PASS live IBus blur/refocus and continued input match native textarea:', destination);
+    }
     assert.deepEqual(errors, []);
     console.log('Chromium', browser.version());
   } finally { await browser?.close(); await server.close(); }
